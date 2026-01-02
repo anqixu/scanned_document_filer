@@ -200,9 +200,9 @@ Respond with JSON:
 
     def _get_default_context(self) -> str:
         """Get default context if none provided.
-        
+
         Attempts to load from data/context.md first.
-        
+
         Returns:
             Context string.
         """

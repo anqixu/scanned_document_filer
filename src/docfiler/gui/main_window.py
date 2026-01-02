@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
 
     def _get_selected_files(self):
         """Get list of selected file paths with suggestions.
-        
+
         Returns:
             List of tuples: (file_path_str, suggestion)
         """
@@ -657,7 +657,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_folder_preserving_state(self, folder_path: str):
         """Reload folder contents without clearing existing suggestions.
-        
+
         Args:
             folder_path: Path to the folder.
         """
@@ -839,7 +839,7 @@ def main():
 
     # Allow Ctrl-C to work by setting up a timer to process events
     # This is needed because Qt event loop blocks signal handling
-    timer = app.startTimer(500)  # Check for signals every 500ms
+    app.startTimer(500)  # Check for signals every 500ms
 
     # Run application
     try:

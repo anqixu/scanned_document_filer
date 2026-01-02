@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ContextGeneratorArgs:
     """Arguments for the context generator CLI.
-    
+
     Attributes:
         path: Path to the folder structure to analyze
         output: Output file path (default: print to stdout)
@@ -88,7 +88,7 @@ def enumerate_folder_structure(
 
     Returns:
         Dictionary with folder structure information.
-        
+
     Note:
         - 'Items' refers to the total count of filesystem entries (files + directories).
         - 'Files scanned' specifically refers to regular files encountered during the scan.
@@ -103,7 +103,7 @@ def enumerate_folder_structure(
     # Preliminary rough scan to count directories to be visited for the progress bar
     logger.info("Performing rough directory scan...")
     total_dirs_to_visit = 0
-    for root, dirs, files in os.walk(root_path):
+    for root, dirs, _files in os.walk(root_path):
         current_rel = Path(root).relative_to(root_path)
         depth = len(current_rel.parts)
 
@@ -263,7 +263,7 @@ def generate_context(
     logger.debug(f"Folder info:\n{folder_info}")
 
     # Create API client
-    client = create_client(
+    create_client(
         provider=config.vlm_provider,
         api_key=config.active_api_key,
         model=config.active_model,

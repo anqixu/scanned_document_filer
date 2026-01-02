@@ -63,7 +63,7 @@ class ClaudeClient(VLMClient):
         # Build content array with images and prompt
         content = []
 
-        for idx, img_bytes in enumerate(images):
+        for _idx, img_bytes in enumerate(images):
             # Encode image as base64
             img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
 

@@ -7,13 +7,9 @@ import io
 import logging
 from pathlib import Path
 
+from pdf2image import convert_from_path
 from PIL import Image
 from pypdf import PdfReader
-
-# Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
-Image.MAX_IMAGE_PIXELS = 200_000_000
-
-from pdf2image import convert_from_path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
@@ -27,6 +23,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
+Image.MAX_IMAGE_PIXELS = 200_000_000
 
 logger = logging.getLogger(__name__)
 
