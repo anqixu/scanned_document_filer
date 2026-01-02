@@ -54,3 +54,12 @@ htmlcov/
 # Application-specific
 temp_images/
 processed_documents/
+
+# Private filing context
+context.md
+context.txt
+src/data/context.md
+src/data/context.txt
+
+# Logs and cached prompts
+logs/

@@ -5,16 +5,19 @@ batch processing capabilities.
 """
 
 import logging
+import os
+import signal
 import sys
+from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
-    QListWidget,
-    QListWidgetItem,
+    QListView,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -55,10 +58,10 @@ class ProcessingThread(QThread):
         for idx, file_path in enumerate(self.files, 1):
             try:
                 suggestion = self.vlm_service.analyze_document(file_path)
-                self.file_processed.emit(file_path, suggestion)
+                self.file_processed.emit(str(file_path), suggestion)
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {e}")
-                self.file_processed.emit(file_path, e)
+                self.file_processed.emit(str(file_path), e)
 
             self.progress.emit(idx, total)
 
@@ -81,6 +84,11 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._load_config()
 
+        # Automatically load default directory if it exists
+        default_dir = Path.home() / "GDrive" / "SHARED" / "__IN__"
+        if default_dir.exists() and default_dir.is_dir():
+            self._load_folder(str(default_dir))
+
     def _init_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle("Document Filer")
@@ -101,10 +109,24 @@ class MainWindow(QMainWindow):
         folder_button.clicked.connect(self._open_folder)
         left_panel.addWidget(folder_button)
 
-        # File list
-        self.file_list = QListWidget()
-        self.file_list.currentRowChanged.connect(self._on_file_selected)
+        # File list with checkboxes
+        self.file_list_model = QStandardItemModel()
+        self.file_list = QListView()
+        self.file_list.setModel(self.file_list_model)
+        self.file_list.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        self.file_list.selectionModel().currentChanged.connect(self._on_file_selected)
         left_panel.addWidget(self.file_list)
+
+        # Selection controls
+        selection_layout = QHBoxLayout()
+        select_all_button = QPushButton("Select All")
+        select_all_button.clicked.connect(self._select_all_files)
+        selection_layout.addWidget(select_all_button)
+
+        select_none_button = QPushButton("Select None")
+        select_none_button.clicked.connect(self._select_no_files)
+        selection_layout.addWidget(select_none_button)
+        left_panel.addLayout(selection_layout)
 
         # Processing controls
         process_button = QPushButton("Process All Files")
@@ -116,10 +138,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         left_panel.addWidget(self.progress_bar)
 
-        # Execute button
-        execute_button = QPushButton("Move/Rename Files")
-        execute_button.clicked.connect(self._execute_filing)
-        left_panel.addWidget(execute_button)
+        # Execute buttons - separate rename and move
+        execute_layout = QVBoxLayout()
+
+        rename_button = QPushButton("Rename Selected Files (in place)")
+        rename_button.clicked.connect(self._execute_rename)
+        execute_layout.addWidget(rename_button)
+
+        move_button = QPushButton("Move Selected Files")
+        move_button.clicked.connect(self._execute_move)
+        execute_layout.addWidget(move_button)
+
+        left_panel.addLayout(execute_layout)
 
         main_layout.addLayout(left_panel, 1)
 
@@ -147,10 +177,13 @@ class MainWindow(QMainWindow):
 
     def _open_folder(self):
         """Open folder selection dialog."""
+        # Default to ~/GDrive/SHARED/__IN__ directory
+        default_dir = str(Path.home() / "GDrive" / "SHARED" / "__IN__")
+
         folder = QFileDialog.getExistingDirectory(
             self,
             "Select Folder with Documents",
-            "",
+            default_dir,
             QFileDialog.Option.ShowDirsOnly,
         )
 
@@ -176,28 +209,37 @@ class MainWindow(QMainWindow):
         logger.info(f"Found {len(self.files)} files")
 
         # Update file list
-        self.file_list.clear()
+        self.file_list_model.clear()
         self.suggestions.clear()
 
         for file_path in self.files:
-            item = QListWidgetItem(file_path.name)
-            item.setData(1, str(file_path))  # Store full path
-            self.file_list.addItem(item)
+            item = QStandardItem(file_path.name)
+            item.setCheckable(True)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(str(file_path), Qt.ItemDataRole.UserRole)  # Store full path
+            self.file_list_model.appendRow(item)
 
         if self.files:
-            self.file_list.setCurrentRow(0)
+            # Select first item
+            first_index = self.file_list_model.index(0, 0)
+            self.file_list.setCurrentIndex(first_index)
 
-    def _on_file_selected(self, index: int):
+    def _on_file_selected(self, current, previous):
         """Handle file selection in the list.
 
         Args:
-            index: Index of the selected file.
+            current: Current QModelIndex
+            previous: Previous QModelIndex
         """
-        if index < 0 or index >= len(self.files):
+        if not current.isValid():
+            return
+        
+        row = current.row()
+        if row < 0 or row >= len(self.files):
             return
 
-        self.current_file_index = index
-        file_path = self.files[index]
+        self.current_file_index = row
+        file_path = self.files[row]
 
         # Update viewer
         self.file_viewer.set_file(file_path)
@@ -252,9 +294,9 @@ class MainWindow(QMainWindow):
         if isinstance(result, Exception):
             logger.error(f"Error processing {file_path}: {result}")
             # Mark as error in the list
-            for i in range(self.file_list.count()):
-                item = self.file_list.item(i)
-                if item.data(1) == file_path:
+            for i in range(self.file_list_model.rowCount()):
+                item = self.file_list_model.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
                     item.setText(f"❌ {Path(file_path).name}")
                     break
         else:
@@ -262,9 +304,9 @@ class MainWindow(QMainWindow):
             self.suggestions[file_path] = result
 
             # Update list item
-            for i in range(self.file_list.count()):
-                item = self.file_list.item(i)
-                if item.data(1) == file_path:
+            for i in range(self.file_list_model.rowCount()):
+                item = self.file_list_model.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
                     item.setText(f"✓ {Path(file_path).name}")
                     break
 
@@ -292,21 +334,56 @@ class MainWindow(QMainWindow):
             f"Errors: {len(self.files) - len(self.suggestions)}",
         )
 
-    def _execute_filing(self):
-        """Execute the file moving/renaming operations."""
-        if not self.suggestions:
+    def _select_all_files(self):
+        """Select all files in the list."""
+        for i in range(self.file_list_model.rowCount()):
+            item = self.file_list_model.item(i)
+            if item:
+                item.setCheckState(Qt.CheckState.Checked)
+        logger.debug("Selected all files")
+
+    def _select_no_files(self):
+        """Deselect all files in the list."""
+        for i in range(self.file_list_model.rowCount()):
+            item = self.file_list_model.item(i)
+            if item:
+                item.setCheckState(Qt.CheckState.Unchecked)
+        logger.debug("Deselected all files")
+
+    def _get_selected_files(self):
+        """Get list of selected file paths with suggestions.
+        
+        Returns:
+            List of tuples: (file_path_str, suggestion)
+        """
+        selected = []
+        for i in range(self.file_list_model.rowCount()):
+            item = self.file_list_model.item(i)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                file_path_str = item.data(Qt.ItemDataRole.UserRole)
+                if file_path_str in self.suggestions:
+                    suggestion = self.suggestions[file_path_str]
+                    if isinstance(suggestion, FilingSuggestion):
+                        selected.append((file_path_str, suggestion))
+        return selected
+
+    def _execute_rename(self):
+        """Rename selected files in place (same directory)."""
+        selected = self._get_selected_files()
+
+        if not selected:
             QMessageBox.warning(
                 self,
-                "No Suggestions",
-                "Please process files first before executing.",
+                "No Files Selected",
+                "Please select files and process them first.",
             )
             return
 
         # Confirm with user
         reply = QMessageBox.question(
             self,
-            "Confirm File Operations",
-            f"This will move/rename {len(self.suggestions)} files.\n"
+            "Confirm Rename",
+            f"This will rename {len(selected)} file(s) in their current location.\n"
             "This operation cannot be undone.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -315,14 +392,74 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Execute file operations
+        # Execute rename operations
         success_count = 0
         error_count = 0
 
-        for file_path_str, suggestion in self.suggestions.items():
-            if not isinstance(suggestion, FilingSuggestion):
-                continue
+        for file_path_str, suggestion in selected:
+            file_path = Path(file_path_str)
 
+            # Rename in same directory
+            new_path = file_path.parent / suggestion.filename
+
+            try:
+                if new_path.exists() and new_path != file_path:
+                    logger.warning(f"Target file already exists: {new_path}")
+                    error_count += 1
+                    continue
+
+                file_path.rename(new_path)
+                logger.info(f"Renamed {file_path.name} -> {suggestion.filename}")
+                success_count += 1
+
+            except Exception as e:
+                logger.error(f"Failed to rename {file_path}: {e}", exc_info=True)
+                error_count += 1
+
+        # Show result
+        QMessageBox.information(
+            self,
+            "Rename Complete",
+            f"Successfully renamed: {success_count} file(s)\n"
+            f"Errors: {error_count} file(s)",
+        )
+
+        # Reload folder
+        if success_count > 0:
+            current_folder = self.files[0].parent if self.files else None
+            if current_folder:
+                self._load_folder(str(current_folder))
+
+    def _execute_move(self):
+        """Move selected files to their suggested destinations."""
+        selected = self._get_selected_files()
+
+        if not selected:
+            QMessageBox.warning(
+                self,
+                "No Files Selected",
+                "Please select files and process them first.",
+            )
+            return
+
+        # Confirm with user
+        reply = QMessageBox.question(
+            self,
+            "Confirm Move",
+            f"This will move {len(selected)} file(s) to their suggested destinations.\n"
+            "This operation cannot be undone.\n\n"
+            "Are you sure you want to continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Execute move operations
+        success_count = 0
+        error_count = 0
+
+        for file_path_str, suggestion in selected:
             # Skip if destination is empty
             if not suggestion.destination:
                 logger.info(f"Skipping {file_path_str} (no destination)")
@@ -339,36 +476,82 @@ class MainWindow(QMainWindow):
                 # Create destination directory if needed
                 dest_dir.mkdir(parents=True, exist_ok=True)
 
+                if dest_path.exists() and dest_path != file_path:
+                    logger.warning(f"Target file already exists: {dest_path}")
+                    error_count += 1
+                    continue
+
                 # Move/rename file
                 file_path.rename(dest_path)
                 logger.info(f"Moved {file_path} -> {dest_path}")
                 success_count += 1
 
             except Exception as e:
-                logger.error(f"Failed to move {file_path}: {e}")
+                logger.error(f"Failed to move {file_path}: {e}", exc_info=True)
                 error_count += 1
 
         # Show result
         QMessageBox.information(
             self,
-            "Filing Complete",
-            f"Successfully moved: {success_count} files\n" f"Errors: {error_count} files",
+            "Move Complete",
+            f"Successfully moved: {success_count} file(s)\n"
+            f"Errors: {error_count} file(s)",
         )
 
-        # Reload folder if we're using same base
+        # Reload folder
         if success_count > 0:
-            self.file_list.clear()
-            self.files.clear()
-            self.suggestions.clear()
+            current_folder = self.files[0].parent if self.files else None
+            if current_folder:
+                self._load_folder(str(current_folder))
+
 
 
 def main():
     """Main entry point for the GUI application."""
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+
+    # Configure Qt platform for different environments
+    if not os.environ.get('QT_QPA_PLATFORM'):
+        if os.environ.get('DISPLAY'):
+            # X server is available (e.g., X410) - use xcb (X11) explicitly
+            # This prevents Qt from trying Wayland first, which X410 doesn't support
+            os.environ['QT_QPA_PLATFORM'] = 'xcb'
+        else:
+            # No display server - use offscreen rendering
+            os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+
+    # Configure logging to both file and console
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_filename = os.path.join(
+        log_dir,
+        f"docfiler_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
+
+    # Create formatters and handlers
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # File handler
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    logger.info(f"Logging to file: {log_filename}")
+    logger.info("Starting Document Filer GUI")
 
     # Create application
     app = QApplication(sys.argv)
@@ -377,8 +560,26 @@ def main():
     window = MainWindow()
     window.show()
 
+    # Set up signal handler for graceful shutdown on Ctrl-C
+    def signal_handler(signum, frame):
+        """Handle Ctrl-C gracefully."""
+        logger.info("Received interrupt signal, shutting down gracefully...")
+        app.quit()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Allow Ctrl-C to work by setting up a timer to process events
+    # This is needed because Qt event loop blocks signal handling
+    timer = app.startTimer(500)  # Check for signals every 500ms
+
     # Run application
-    sys.exit(app.exec())
+    try:
+        exit_code = app.exec()
+        logger.info("Application exited normally")
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

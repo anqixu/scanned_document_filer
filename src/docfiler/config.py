@@ -34,6 +34,7 @@ class Config:
     pdf_pages_to_extract: int
 
     # File Organization
+    source_dir: str | None
     default_dest_base: str | None
 
     # Logging
@@ -124,6 +125,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         raise ValueError(msg) from e
 
     # Load file organization settings
+    source_dir = os.getenv("SOURCE_DIR") or None
     default_dest_base = os.getenv("DEFAULT_DEST_BASE") or None
 
     # Load logging configuration
@@ -144,6 +146,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         image_dpi=image_dpi,
         max_image_dimension=max_image_dimension,
         pdf_pages_to_extract=pdf_pages_to_extract,
+        source_dir=source_dir,
         default_dest_base=default_dest_base,
         log_level=log_level,
     )

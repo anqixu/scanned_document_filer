@@ -1,9 +1,7 @@
 """Unit tests for VLM service module."""
 
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-import pytest
 from PIL import Image
 
 from docfiler.config import Config

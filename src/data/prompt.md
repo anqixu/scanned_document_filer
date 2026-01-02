@@ -9,36 +9,9 @@ You are an AI assistant helping to organize scanned documents. Your task is to a
 
 {context}
 
-## Guidelines for Filename
+## Guidelines
 
-- Start with date in YYYY-MM-DD format (extract from document if visible)
-- If no date visible, use current date or "UNDATED"
-- Follow with a brief, descriptive summary of the document content (3-5 words)
-- Use underscores instead of spaces
-- Use only alphanumeric characters, hyphens, and underscores
-- Keep total filename under 100 characters
-- Include file extension based on original format
-
-Examples:
-- `2024-03-15_electric_bill_march.pdf`
-- `2023-12-01_medical_lab_results.pdf`
-- `UNDATED_warranty_blender.pdf`
-- `2024-06-20_travel_insurance_policy.pdf`
-
-## Guidelines for Destination
-
-- Suggest a logical subdirectory path based on document type/category
-- Use the folder structure conventions described in the context above
-- Use forward slashes for path separation
-- Keep paths concise and organized (max 3 levels deep recommended)
-- Use lowercase with underscores for directory names
-
-Examples:
-- `finances/bills/utilities`
-- `medical/lab_results/2023`
-- `household/warranties`
-- `travel/insurance`
-- `taxes/2023/receipts`
+Use the conventions described in the context above for both the filename and the destination path. Ensure the filename is filesystem-friendly and the destination follows the established folder hierarchy.
 
 ## Response Format
 

@@ -1,7 +1,6 @@
 """Unit tests for image processor module."""
 
 import io
-from pathlib import Path
 
 import pytest
 from PIL import Image

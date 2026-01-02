@@ -9,7 +9,7 @@ import logging
 from abc import ABC, abstractmethod
 
 import anthropic
-import google.generativeai as genai
+from google import genai
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -210,8 +210,7 @@ class GeminiClient(VLMClient):
             api_key: Google API key.
             model: Model name (e.g., 'gemini-2.0-flash-exp').
         """
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model)
+        self.client = genai.Client(api_key=api_key)
         self.model_name = model
 
     def analyze_document(self, prompt: str, images: list[bytes]) -> dict:
@@ -240,7 +239,10 @@ class GeminiClient(VLMClient):
         content.append(prompt)
 
         # Make API call
-        response = self.model.generate_content(content)
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=content
+        )
         response_text = response.text
         logger.debug(f"Gemini response: {response_text}")
 

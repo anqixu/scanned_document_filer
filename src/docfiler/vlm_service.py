@@ -4,8 +4,11 @@ This module coordinates the workflow of processing documents and getting
 filename and destination suggestions from VLM providers.
 """
 
+import json
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .api_clients import create_client
@@ -79,9 +82,37 @@ class VLMService:
 
         # Build prompt with context
         prompt = self._build_prompt()
+        
+        # Cache prompt to logs/
+        log_dir = Path(__file__).parent.parent.parent / "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = "".join(x for x in file_path.name if x.isalnum() or x in "._- ")
+        cache_file = log_dir / f"prompt_{timestamp}_{safe_filename}.md"
+        
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(f"# Prompt Cache: {file_path.name}\n\n")
+            f.write(f"**Timestamp**: {datetime.now().isoformat()}\n")
+            f.write(f"**File**: {file_path}\n\n")
+            f.write("## Prompt\n\n")
+            f.write(prompt)
+            f.write("\n\n---\n\n")
 
         # Send to VLM for analysis
-        response = self.client.analyze_document(prompt, images)
+        try:
+            response = self.client.analyze_document(prompt, images)
+            
+            # Append response to cache
+            with open(cache_file, "a", encoding="utf-8") as f:
+                f.write("## Response\n\n")
+                f.write("```json\n")
+                f.write(json.dumps(response, indent=2))
+                f.write("\n```\n")
+        except Exception as e:
+            # Log error to cache
+            with open(cache_file, "a", encoding="utf-8") as f:
+                f.write(f"## Error\n\n{e}\n")
+            raise
 
         # Create suggestion from response
         suggestion = FilingSuggestion(
@@ -109,7 +140,7 @@ class VLMService:
             Prompt template content.
         """
         # Look for prompt.md in the data directory
-        prompt_path = Path(__file__).parent / "data" / "prompt.md"
+        prompt_path = Path(__file__).parent.parent / "data" / "prompt.md"
 
         if prompt_path.exists():
             with open(prompt_path, encoding="utf-8") as f:
@@ -143,10 +174,26 @@ Respond with JSON:
 
     def _get_default_context(self) -> str:
         """Get default context if none provided.
-
+        
+        Attempts to load from data/context.md first.
+        
         Returns:
-            Default context string.
+            Context string.
         """
+        # Look for context.md in the data directory
+        context_path = Path(__file__).parent.parent / "data" / "context.md"
+        
+        if context_path.exists():
+            try:
+                with open(context_path, encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content:
+                        logger.info(f"Loaded context from {context_path}")
+                        return content
+            except Exception as e:
+                logger.error(f"Error loading context from {context_path}: {e}")
+
+        # Fallback to hardcoded default
         return """
 This is a general document filing system. Common categories include:
 
