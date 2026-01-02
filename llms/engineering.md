@@ -39,6 +39,23 @@
 - **Environment**: Use `pytest-qt` for GUI testing and `pytest-cov` for coverage monitoring.
 - **Locations**: Tests are mirroring the `src/docfiler/` structure inside `src/tests/`.
 
+## Code Quality & Linting
+
+- **Tooling**: Use `ruff` for all linting and formatting fixes. Use `ruff check . --fix` regularly.
+- **Unused Variables**: Prefer `_` prefix for intentionally unused loop variables or unpacked values.
+
+## Resilience & UX
+
+### CLI Interrupts
+- **Two-Stage Stop**: For long-running operations (like filesystem scans), the first `Ctrl+C` should stop the process gracefully and save intermediate results. The second `Ctrl+C` should exit immediately.
+
+### Directory Traversal
+- **Depth & Control**: Use `os.walk` with in-place modification of `dirs[:] = []` to enforce recursion limits and implement directory blacklisting efficiently.
+
+### GUI Responsiveness
+- **Non-Blocking Logic**: Long-running operations (like VLM analysis or file moves) must run in background threads (`QThread`) to keep the GUI interactive.
+- **State Preservation**: UI refreshes should preserve pending user edits or AI suggestions when reloading folder contents.
+
 ## Configuration
 
 - **Environment-First**: All secrets and local path configurations (like `SOURCE_DIR`, `VLM_MAX_TOKENS`, and `SCAN_IGNORE_PATTERNS`) go in `.env`.
@@ -46,4 +63,4 @@
 - **Fail Fast**: The application must validate required API keys and paths at startup.
 
 ---
-**Version**: 2.0 | **Updated**: 2026-01-01
+**Version**: 3.0 | **Updated**: 2026-01-01
