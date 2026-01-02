@@ -16,10 +16,12 @@ Image.MAX_IMAGE_PIXELS = 200_000_000
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -41,21 +43,31 @@ class FileViewerWidget(QWidget):
     def __init__(self, parent=None):
         """Initialize the file viewer widget."""
         super().__init__(parent)
-        self._init_ui()
+        self.source_dir = None
         self._file_path = None
         self._is_skipped = False
+        self._full_pixmap = QPixmap()
+        self._zoom_factor = 1.0
+        self._fit_to_view = True
+        self._init_ui()
 
     def _init_ui(self):
         """Initialize the user interface."""
         layout = QVBoxLayout(self)
 
-        # Preview area (for images/PDFs)
+        # Preview area (Scrollable and Zoomable)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(False)  # We handle resizing ourselves
+        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll_area.setStyleSheet("QScrollArea { background-color: #f0f0f0; border: 1px solid #ccc; }")
+        self.scroll_area.setMinimumSize(400, 400)
+        
         self.preview_label = QLabel("No file selected")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(400, 400)
-        self.preview_label.setStyleSheet("QLabel { background-color: #f0f0f0; border: 1px solid #ccc; }")
-        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.preview_label)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        
+        self.scroll_area.setWidget(self.preview_label)
+        layout.addWidget(self.scroll_area)
 
         # File info
         info_layout = QVBoxLayout()
@@ -85,6 +97,12 @@ class FileViewerWidget(QWidget):
         self.dest_edit.setPlaceholderText("Suggested destination will appear here")
         self.dest_edit.textChanged.connect(self._on_destination_changed)
         dest_layout.addWidget(self.dest_edit)
+        
+        # Add browse button
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self._on_browse_clicked)
+        dest_layout.addWidget(self.browse_button)
+        
         info_layout.addLayout(dest_layout)
 
         # Confidence and reasoning
@@ -106,6 +124,22 @@ class FileViewerWidget(QWidget):
         button_layout.addWidget(self.skip_button)
 
         button_layout.addStretch()
+
+        # Zoom controls
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedWidth(30)
+        zoom_in_btn.clicked.connect(self.zoom_in)
+        button_layout.addWidget(zoom_in_btn)
+
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedWidth(30)
+        zoom_out_btn.clicked.connect(self.zoom_out)
+        button_layout.addWidget(zoom_out_btn)
+
+        self.fit_button = QPushButton("Fit")
+        self.fit_button.setFixedWidth(50)
+        self.fit_button.clicked.connect(self.reset_zoom)
+        button_layout.addWidget(self.fit_button)
 
         layout.addLayout(button_layout)
 
@@ -146,18 +180,16 @@ class FileViewerWidget(QWidget):
                 if pixmap.isNull():
                     raise ValueError("Failed to create QPixmap from image data")
 
-                # Scale to fit preview label size
-                scaled = pixmap.scaled(
-                    self.preview_label.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                self.preview_label.setPixmap(scaled)
+                self._full_pixmap = pixmap
+                self._zoom_factor = 1.0
+                self._fit_to_view = True
+                self._update_preview()
                 logger.debug(f"Successfully loaded image preview: {self._file_path.name}")
                 
             except Exception as e:
                 logger.error(f"Image preview loading failed for {self._file_path}: {e}", exc_info=True)
                 self.preview_label.setText(f"Could not load image\n{self._file_path.name}\n{str(e)}")
+                self._full_pixmap = QPixmap()
 
         elif self._file_path.suffix.lower() == ".pdf":
             # For PDFs, try multiple approaches
@@ -167,13 +199,13 @@ class FileViewerWidget(QWidget):
                 try:
                     logger.debug("Attempting PDF rendering with pdf2image")
 
-                    # Convert first page only
+                    # Convert first page only (use a higher DPI for zooming headroom)
                     images = convert_from_path(
                         str(self._file_path),
                         first_page=1,
                         last_page=1,
-                        dpi=150,
-                        size=(800, None)  # Limit width to 800px
+                        dpi=200,
+                        size=(1200, None)
                     )
 
                     if images:
@@ -182,12 +214,10 @@ class FileViewerWidget(QWidget):
                         pixmap = self._pil_to_qpixmap(img)
 
                         if not pixmap.isNull():
-                            scaled = pixmap.scaled(
-                                self.preview_label.size(),
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation,
-                            )
-                            self.preview_label.setPixmap(scaled)
+                            self._full_pixmap = pixmap
+                            self._zoom_factor = 1.0
+                            self._fit_to_view = True
+                            self._update_preview()
                             logger.debug(f"Successfully rendered PDF with pdf2image: {self._file_path.name}")
                             return
                         else:
@@ -216,30 +246,54 @@ class FileViewerWidget(QWidget):
                                 if obj.get('/Subtype') == '/Image':
                                     try:
                                         logger.debug(f"Extracting image object: {obj_name}")
-
-                                        # Get image properties
                                         width = int(obj['/Width'])
                                         height = int(obj['/Height'])
-                                        
-                                        # Get decompressed data (pypdf handles decompression)
-                                        try:
-                                            data = obj.get_data()
-                                        except Exception as e:
-                                            logger.warning(f"Failed to get data for {obj_name}: {e}")
-                                            continue
-
-                                        # Determine color mode and expected size
+                                        data = obj.get_data()
                                         color_space = obj.get('/ColorSpace', '/DeviceRGB')
-                                        bits_per_component = int(obj.get('/BitsPerComponent', 8))
                                         
                                         if color_space == '/DeviceRGB':
                                             mode = "RGB"
-                                            expected_size = width * height * 3
                                         elif color_space == '/DeviceGray':
                                             mode = "L"
-                                            expected_size = width * height
                                         elif color_space == '/DeviceCMYK':
                                             mode = "CMYK"
+                                        else:
+                                            mode = "RGB"
+
+                                        img = Image.frombytes(mode, (width, height), data)
+                                        if mode == "CMYK":
+                                            img = img.convert("RGB")
+                                        
+                                        pixmap = self._pil_to_qpixmap(img)
+                                        if not pixmap.isNull():
+                                            self._full_pixmap = pixmap
+                                            self._zoom_factor = 1.0
+                                            self._fit_to_view = True
+                                            self._update_preview()
+                                            images_found = True
+                                            break
+                                    except Exception as e:
+                                        logger.warning(f"Fallback image extraction failed for {obj_name}: {e}")
+                                        continue
+
+                        if not images_found:
+                            self.preview_label.setText(f"PDF loaded but no images found on first page.\n{self._file_path.name}")
+                            self._full_pixmap = QPixmap()
+                    except Exception as e:
+                        logger.warning(f"PDF extraction structure error: {e}")
+                        self.preview_label.setText(f"Could not extract content from PDF.\n{str(e)}")
+                        self._full_pixmap = QPixmap()
+                else:
+                    self.preview_label.setText(f"PDF file has no pages.\n{self._file_path.name}")
+                    self._full_pixmap = QPixmap()
+
+            except Exception as e:
+                logger.error(f"PDF preview failed for {self._file_path}: {e}")
+                self.preview_label.setText(f"Could not load PDF preview.\n{str(e)}")
+                self._full_pixmap = QPixmap()
+        else:
+            self.preview_label.setText("Unsupported file type")
+            self._full_pixmap = QPixmap()
                                             expected_size = width * height * 4
                                         else:
                                             # Try RGB as default
@@ -414,6 +468,107 @@ class FileViewerWidget(QWidget):
             self.skip_button.setText("Skip This File")
 
         self.skip_toggled.emit(checked)
+
+    def _on_browse_clicked(self):
+        """Handle browse button click."""
+        # Use source_dir as start, or fallback to current dest or home
+        start_dir = self.source_dir
+        if not start_dir:
+            start_dir = Path.home()
+        else:
+            start_dir = Path(start_dir)
+            
+        current_dest = self.dest_edit.text().strip()
+        if current_dest:
+            potential_path = start_dir / current_dest
+            if potential_path.exists():
+                start_dir = potential_path
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Destination Folder",
+            str(start_dir),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+
+        if folder:
+            folder_path = Path(folder)
+            # Try to make relative to source_dir if possible
+            if self.source_dir:
+                try:
+                    rel_path = folder_path.relative_to(Path(self.source_dir))
+                    self.dest_edit.setText(str(rel_path))
+                    return
+                except ValueError:
+                    # Not relative to source_dir
+                    pass
+            
+            # Fallback to full path
+            self.dest_edit.setText(str(folder_path))
+
+    def _update_preview(self):
+        """Update the preview image based on current zoom and fit settings."""
+        if self._full_pixmap.isNull():
+            return
+
+        if self._fit_to_view:
+            # Calculate zoom factor to fit the scroll area
+            area_size = self.scroll_area.viewport().size()
+            scaled = self._full_pixmap.scaled(
+                area_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            # Update internal zoom factor to match
+            self._zoom_factor = scaled.width() / self._full_pixmap.width()
+        else:
+            # Apply manual zoom factor
+            new_size = self._full_pixmap.size() * self._zoom_factor
+            scaled = self._full_pixmap.scaled(
+                new_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+
+        self.preview_label.setPixmap(scaled)
+        self.preview_label.resize(scaled.size())
+
+    def zoom_in(self):
+        """Increase zoom factor."""
+        self._fit_to_view = False
+        self._zoom_factor *= 1.2
+        self._update_preview()
+
+    def zoom_out(self):
+        """Decrease zoom factor."""
+        self._fit_to_view = False
+        self._zoom_factor /= 1.2
+        # Minimum zoom 10%
+        self._zoom_factor = max(0.1, self._zoom_factor)
+        self._update_preview()
+
+    def reset_zoom(self):
+        """Reset to Fit to View mode."""
+        self._fit_to_view = True
+        self._update_preview()
+
+    def resizeEvent(self, event):
+        """Handle resize events to update Fit to View."""
+        super().resizeEvent(event)
+        if self._fit_to_view:
+            self._update_preview()
+
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zooming with Ctrl."""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
     def _on_filename_changed(self, text: str):
         """Handle filename text change."""

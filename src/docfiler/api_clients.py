@@ -19,7 +19,7 @@ class VLMClient(ABC):
     """Abstract base class for VLM API clients."""
 
     @abstractmethod
-    def analyze_document(self, prompt: str, images: list[bytes]) -> dict:
+    def analyze_document(self, prompt: str, images: list[bytes], max_tokens: int = 1024) -> dict:
         """Analyze document images with a prompt.
 
         Args:
@@ -48,7 +48,7 @@ class ClaudeClient(VLMClient):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-    def analyze_document(self, prompt: str, images: list[bytes]) -> dict:
+    def analyze_document(self, prompt: str, images: list[bytes], max_tokens: int = 1024) -> dict:
         """Analyze document images with Claude.
 
         Args:
@@ -85,7 +85,7 @@ class ClaudeClient(VLMClient):
         # Make API call
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": content}],
         )
 
@@ -145,7 +145,7 @@ class OpenAIClient(VLMClient):
         self.client = OpenAI(api_key=api_key)
         self.model = model
 
-    def analyze_document(self, prompt: str, images: list[bytes]) -> dict:
+    def analyze_document(self, prompt: str, images: list[bytes], max_tokens: int = 1024) -> dict:
         """Analyze document images with GPT-4 Vision.
 
         Args:
@@ -175,17 +175,26 @@ class OpenAIClient(VLMClient):
             "text": prompt,
         })
 
-        # Make API call
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        # Prepare parameters for the API call
+        params = {
+            "model": self.model,
+            "messages": [
                 {
                     "role": "user",
                     "content": content,
                 }
             ],
-            max_tokens=1024,
-        )
+        }
+
+        # Newer models (like o1 series or newer GPT versions) use max_completion_tokens
+        # instead of max_tokens.
+        if self.model.startswith(("o1-", "gpt-5")):
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+
+        # Make API call
+        response = self.client.chat.completions.create(**params)
 
         # Extract response text
         response_text = response.choices[0].message.content
@@ -213,7 +222,7 @@ class GeminiClient(VLMClient):
         self.client = genai.Client(api_key=api_key)
         self.model_name = model
 
-    def analyze_document(self, prompt: str, images: list[bytes]) -> dict:
+    def analyze_document(self, prompt: str, images: list[bytes], max_tokens: int = 1024) -> dict:
         """Analyze document images with Gemini.
 
         Args:
@@ -225,23 +234,25 @@ class GeminiClient(VLMClient):
         """
         logger.info(f"Sending request to Gemini ({self.model_name})")
 
-        # Build content array
-        content = []
+        # Build content list with parts
+        parts = []
 
         for img_bytes in images:
-            # Gemini expects PIL Image or image dict
-            content.append({
-                "mime_type": "image/png",
-                "data": img_bytes,
-            })
+            parts.append(genai.types.Part.from_bytes(
+                data=img_bytes,
+                mime_type="image/png"
+            ))
 
-        # Add prompt
-        content.append(prompt)
+        # Add prompt text as a part
+        parts.append(genai.types.Part.from_text(text=prompt))
 
         # Make API call
         response = self.client.models.generate_content(
             model=self.model_name,
-            contents=content
+            contents=parts,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+            )
         )
         response_text = response.text
         logger.debug(f"Gemini response: {response_text}")

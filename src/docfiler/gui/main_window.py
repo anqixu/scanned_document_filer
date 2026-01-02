@@ -34,6 +34,57 @@ from .file_viewer import FileViewerWidget
 logger = logging.getLogger(__name__)
 
 
+class CheckableListView(QListView):
+    """QListView that supports shift-click for mass checkbox toggling."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.last_index = None
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.pos())
+        
+        if not index.isValid():
+            super().mousePressEvent(event)
+            return
+
+        # Check if shift is held and we have a previous index
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and self.last_index is not None:
+            model = self.model()
+            if model and hasattr(model, "itemFromIndex"):
+                target_item = model.itemFromIndex(index)
+                
+                # Capture state before super()
+                old_state = target_item.checkState()
+                
+                # Let super process (handles selection and potential toggle)
+                super().mousePressEvent(event)
+                
+                # Get state after super()
+                new_state = target_item.checkState()
+                
+                # If clicking the text (no toggle happened), we force a toggle 
+                # based on the last item's state or just invert.
+                if new_state == old_state:
+                    new_state = Qt.CheckState.Unchecked if old_state == Qt.CheckState.Checked else Qt.CheckState.Checked
+                    target_item.setCheckState(new_state)
+
+                start_row = min(self.last_index.row(), index.row())
+                end_row = max(self.last_index.row(), index.row())
+                
+                # Apply new state to the whole range
+                for row in range(start_row, end_row + 1):
+                    item = model.item(row)
+                    if item:
+                        item.setCheckState(new_state)
+                
+                self.last_index = index
+                return
+
+        super().mousePressEvent(event)
+        self.last_index = index
+
+
 class ProcessingThread(QThread):
     """Background thread for processing documents."""
 
@@ -61,7 +112,6 @@ class ProcessingThread(QThread):
                 suggestion = self.vlm_service.analyze_document(file_path)
                 self.file_processed.emit(str(file_path), suggestion)
             except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}")
                 self.file_processed.emit(str(file_path), e)
 
             self.progress.emit(idx, total)
@@ -141,13 +191,17 @@ class MainWindow(QMainWindow):
 
         # File list with checkboxes
         self.file_list_model = QStandardItemModel()
-        self.file_list = QListView()
+        self.file_list = CheckableListView()
         self.file_list.setModel(self.file_list_model)
         self.file_list.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
         self.file_list.selectionModel().currentChanged.connect(self._on_file_selected)
         left_panel.addWidget(self.file_list)
 
-        # Selection controls
+        # Right panel - file viewer
+        self.file_viewer = FileViewerWidget()
+        self.file_viewer.filename_changed.connect(self._on_viewer_filename_changed)
+        self.file_viewer.destination_changed.connect(self._on_viewer_destination_changed)
+        main_layout.addWidget(self.file_viewer, 2)
         selection_layout = QHBoxLayout()
         select_all_button = QPushButton("Select All")
         select_all_button.clicked.connect(self._select_all_files)
@@ -159,8 +213,8 @@ class MainWindow(QMainWindow):
         left_panel.addLayout(selection_layout)
 
         # Processing controls
-        self.process_button = QPushButton("Process All Files")
-        self.process_button.clicked.connect(self._process_all)
+        self.process_button = QPushButton("Process Selected Files")
+        self.process_button.clicked.connect(self._process_selected)
         left_panel.addWidget(self.process_button)
 
         # Context generation
@@ -181,17 +235,13 @@ class MainWindow(QMainWindow):
         rename_button.clicked.connect(self._execute_rename)
         execute_layout.addWidget(rename_button)
 
-        move_button = QPushButton("Move Selected Files")
+        move_button = QPushButton("Rename and Move Selected Files")
         move_button.clicked.connect(self._execute_move)
         execute_layout.addWidget(move_button)
 
         left_panel.addLayout(execute_layout)
 
         main_layout.addLayout(left_panel, 1)
-
-        # Right panel - file viewer
-        self.file_viewer = FileViewerWidget()
-        main_layout.addWidget(self.file_viewer, 2)
 
     def _load_config(self):
         """Load application configuration."""
@@ -201,6 +251,10 @@ class MainWindow(QMainWindow):
 
             # Create VLM service
             self.vlm_service = create_vlm_service(self.config)
+            
+            # Update file viewer with source dir
+            if self.config.source_dir:
+                self.file_viewer.source_dir = self.config.source_dir
 
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
@@ -247,6 +301,7 @@ class MainWindow(QMainWindow):
         # Update file list
         self.file_list_model.clear()
         self.suggestions.clear()
+        self.file_list.last_index = None  # Reset shift-click starting point
 
         for file_path in self.files:
             item = QStandardItem(file_path.name)
@@ -254,6 +309,14 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(str(file_path), Qt.ItemDataRole.UserRole)  # Store full path
             self.file_list_model.appendRow(item)
+            
+            # Pre-populate with current filename by default
+            self.suggestions[str(file_path)] = FilingSuggestion(
+                filename=file_path.name,
+                destination="",
+                confidence=1.0,
+                reasoning="Current state"
+            )
 
         if self.files:
             # Select first item
@@ -297,21 +360,60 @@ class MainWindow(QMainWindow):
             # No suggestion at all for this file
             self.file_viewer.clear_suggestion()
 
-    def _process_all(self):
-        """Process all files in the list."""
-        if not self.files:
-            QMessageBox.warning(self, "No Files", "Please open a folder first.")
+    def _on_viewer_filename_changed(self, text):
+        """Handle manual filename changes in the viewer."""
+        if self.current_file_index >= 0:
+            file_path = str(self.files[self.current_file_index])
+            suggestion = self.suggestions.get(file_path)
+            if isinstance(suggestion, FilingSuggestion):
+                suggestion.filename = text
+            else:
+                self.suggestions[file_path] = FilingSuggestion(
+                    filename=text,
+                    destination="",
+                    confidence=1.0,
+                    reasoning="Manual override"
+                )
+
+    def _on_viewer_destination_changed(self, text):
+        """Handle manual destination changes in the viewer."""
+        if self.current_file_index >= 0:
+            file_path = str(self.files[self.current_file_index])
+            suggestion = self.suggestions.get(file_path)
+            if isinstance(suggestion, FilingSuggestion):
+                suggestion.destination = text
+            else:
+                self.suggestions[file_path] = FilingSuggestion(
+                    filename=Path(file_path).name,
+                    destination=text,
+                    confidence=1.0,
+                    reasoning="Manual override"
+                )
+
+    def _process_selected(self):
+        """Process only the checked files in the list."""
+        checked_files = []
+        for i in range(self.file_list_model.rowCount()):
+            item = self.file_list_model.item(i)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                file_path = item.data(Qt.ItemDataRole.UserRole)
+                if file_path:
+                    checked_files.append(Path(file_path))
+
+        if not checked_files:
+            QMessageBox.warning(self, "No Selection", "Please check at least one file to process.")
             return
 
         # Disable only action buttons during processing
+        # The user can still browse and select files
         self.process_button.setEnabled(False)
         self.context_button.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(self.files))
+        self.progress_bar.setMaximum(len(checked_files))
         self.progress_bar.setValue(0)
 
         # Start processing thread
-        self.processing_thread = ProcessingThread(self.files, self.vlm_service)
+        self.processing_thread = ProcessingThread(checked_files, self.vlm_service)
         self.processing_thread.progress.connect(self._on_progress)
         self.processing_thread.file_processed.connect(self._on_file_processed)
         self.processing_thread.finished.connect(self._on_processing_finished)
@@ -371,13 +473,11 @@ class MainWindow(QMainWindow):
         self.process_button.setEnabled(True)
         self.context_button.setEnabled(True)
 
-        QMessageBox.information(
-            self,
-            "Processing Complete",
-            f"Processed {len(self.files)} files.\n"
-            f"Successful: {len(self.suggestions)}\n"
-            f"Errors: {len(self.files) - len(self.suggestions)}",
-        )
+        # Log summary instead of a popup
+        success_count = sum(1 for s in self.suggestions.values() if isinstance(s, FilingSuggestion))
+        error_count = sum(1 for s in self.suggestions.values() if isinstance(s, Exception))
+        
+        logger.info(f"Processing Complete: {success_count} successful, {error_count} failed")
 
     def _select_all_files(self):
         """Select all files in the list."""
@@ -441,10 +541,11 @@ class MainWindow(QMainWindow):
         success_count = 0
         error_count = 0
 
+        # Prepare state migration for successful renames
+        migrated_suggestions = {}
+        
         for file_path_str, suggestion in selected:
             file_path = Path(file_path_str)
-
-            # Rename in same directory
             new_path = file_path.parent / suggestion.filename
 
             try:
@@ -454,26 +555,36 @@ class MainWindow(QMainWindow):
                     continue
 
                 file_path.rename(new_path)
-                logger.info(f"Renamed {file_path.name} -> {suggestion.filename}")
+                logger.info(f"Renamed {file_path_str} -> {new_path}")
+                
+                # Keep the suggestion but update it for the new path
+                # Also mark as successfully renamed for state migration
+                migrated_suggestions[str(new_path)] = suggestion
                 success_count += 1
 
             except Exception as e:
                 logger.error(f"Failed to rename {file_path}: {e}", exc_info=True)
                 error_count += 1
 
-        # Show result
-        QMessageBox.information(
-            self,
-            "Rename Complete",
-            f"Successfully renamed: {success_count} file(s)\n"
-            f"Errors: {error_count} file(s)",
-        )
+        # Log result
+        logger.info(f"Rename Complete: Successfully renamed: {success_count} file(s), Errors: {error_count} file(s)")
 
-        # Reload folder
+        # Update and reload folder without losing state
         if success_count > 0:
+            # We don't clear suggestions entirely. We migrate the renamed ones.
+            # Any non-renamed files will keep their suggestions.
+            for old_path, suggestion in selected:
+                if str(Path(old_path).parent / suggestion.filename) in migrated_suggestions:
+                    self.suggestions.pop(old_path, None)
+            
+            # Merge migrated suggestions back
+            self.suggestions.update(migrated_suggestions)
+            
+            # Force a re-scan of the folder to update self.files and the list model
+            # but preserve our current self.suggestions
             current_folder = self.files[0].parent if self.files else None
             if current_folder:
-                self._load_folder(str(current_folder))
+                self._refresh_folder_preserving_state(str(current_folder))
 
     def _execute_move(self):
         """Move selected files to their suggested destinations."""
@@ -490,8 +601,8 @@ class MainWindow(QMainWindow):
         # Confirm with user
         reply = QMessageBox.question(
             self,
-            "Confirm Move",
-            f"This will move {len(selected)} file(s) to their suggested destinations.\n"
+            "Confirm Rename and Move",
+            f"This will rename and move {len(selected)} file(s) to their suggested destinations.\n"
             "This operation cannot be undone.\n\n"
             "Are you sure you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -535,19 +646,64 @@ class MainWindow(QMainWindow):
                 logger.error(f"Failed to move {file_path}: {e}", exc_info=True)
                 error_count += 1
 
-        # Show result
-        QMessageBox.information(
-            self,
-            "Move Complete",
-            f"Successfully moved: {success_count} file(s)\n"
-            f"Errors: {error_count} file(s)",
-        )
+        # Log result
+        logger.info(f"Move Complete: Successfully moved: {success_count} file(s), Errors: {error_count} file(s)")
 
         # Reload folder
         if success_count > 0:
             current_folder = self.files[0].parent if self.files else None
             if current_folder:
                 self._load_folder(str(current_folder))
+
+    def _refresh_folder_preserving_state(self, folder_path: str):
+        """Reload folder contents without clearing existing suggestions.
+        
+        Args:
+            folder_path: Path to the folder.
+        """
+        folder = Path(folder_path)
+        logger.debug(f"Refreshing folder: {folder}")
+
+        # Find all supported files
+        patterns = ["*.pdf", "*.png", "*.jpg", "*.jpeg", "*.tiff", "*.tif", "*.bmp"]
+        self.files = []
+
+        for pattern in patterns:
+            self.files.extend(folder.glob(pattern))
+
+        # Update file list model but keep self.suggestions!
+        self.file_list_model.clear()
+
+        for file_path in self.files:
+            file_str = str(file_path)
+            item = QStandardItem(file_path.name)
+            item.setCheckable(True)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(file_str, Qt.ItemDataRole.UserRole)
+            
+            # Mark processed/state
+            if file_str in self.suggestions:
+                res = self.suggestions[file_str]
+                if isinstance(res, FilingSuggestion):
+                    item.setText(f"✓ {file_path.name}")
+                elif isinstance(res, Exception):
+                    item.setText(f"❌ {file_path.name}")
+            else:
+                # New file or one we lost state for
+                self.suggestions[file_str] = FilingSuggestion(
+                    filename=file_path.name,
+                    destination="",
+                    confidence=1.0,
+                    reasoning="Refreshed"
+                )
+            
+            self.file_list_model.appendRow(item)
+
+        if self.files:
+            # Re-select the same index if valid, else first
+            new_index = self.current_file_index if 0 <= self.current_file_index < len(self.files) else 0
+            first_index = self.file_list_model.index(new_index, 0)
+            self.file_list.setCurrentIndex(first_index)
 
     def _generate_context(self):
         """Generate filing context from the organized documents directory."""

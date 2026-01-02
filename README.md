@@ -44,8 +44,8 @@ docfiler-gui
 ```
 1. **Load**: Auto-loads from your configured source directory.
 2. **Scan**: Click **"Generate Filing Context"** to sync AI conventions with your existing documents.
-3. **Analyze**: Click **"Process All Files"** to get naming and destination suggestions.
-4. **Execute**: Select files and click **"Rename"** or **"Move"** to apply changes.
+3. **Analyze**: Click **"Process Selected Files"** to get naming and destination suggestions.
+4. **Execute**: Select files and click **"Rename"** or **"Rename and Move"** to apply changes.
 
 ### Context Generator (CLI)
 Sync your filing patterns manually:
@@ -61,7 +61,15 @@ docfiler-context
 | `VLM_PROVIDER` | `claude`, `openai`, or `gemini` |
 | `SOURCE_DIR` | Root folder where your organized documents are kept. |
 | `DEFAULT_DEST_BASE` | Where suggested documents should be moved to. |
-| `IMAGE_DPI` | Target DPI for analysis (default: 300). |
+| `VLM_MAX_TOKENS` | Max tokens for VLM response (default: 1024). |
+
+## Customization
+
+You can fine-tune the AI's behavior by editing the files in `src/data/`:
+
+- **`prompt.md`**: The base structural prompt for the VLM.
+- **`context.md`**: Automatically generated filing patterns.
+- **`extra_instructions.md`**: Manually add your own rules (e.g., "Always use YYYYMMDD format", "Avoid underscores").
 
 ## Documentation
 

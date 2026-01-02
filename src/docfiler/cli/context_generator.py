@@ -8,7 +8,8 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from simple_parsing import ArgumentParser, field
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +17,6 @@ import anthropic
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from simple_parsing import ArgumentParser
 from tqdm import tqdm
 
 from ..api_clients import create_client
@@ -36,7 +36,7 @@ class ContextGeneratorArgs:
         max_depth: Maximum depth to traverse in folder structure
         max_files_per_dir: Maximum number of example files to show per directory
     """
-    path: str | None = field(default=None, positional=True)
+    path: str | None = field(default=None)
     """Path to the folder structure to analyze (defaults to SOURCE_DIR in config)"""
     
     output: str | None = field(default=None, alias="-o")
@@ -253,18 +253,27 @@ def _generate_with_provider(config, prompt: str) -> str:
         client = anthropic.Anthropic(api_key=config.active_api_key)
         response = client.messages.create(
             model=config.active_model,
-            max_tokens=2048,
+            max_tokens=config.vlm_max_tokens * 2,  # Context generation might need more space
             messages=[{"role": "user", "content": prompt}],
         )
         return response.content[0].text
 
     elif provider == "openai":
         client = OpenAI(api_key=config.active_api_key)
-        response = client.chat.completions.create(
-            model=config.active_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
-        )
+        
+        # Determine token parameter based on model
+        max_tokens = config.vlm_max_tokens * 2
+        params = {
+            "model": config.active_model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        
+        if config.active_model.startswith(("o1-", "gpt-5")):
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+            
+        response = client.chat.completions.create(**params)
         return response.choices[0].message.content
 
     elif provider == "gemini":
@@ -273,7 +282,7 @@ def _generate_with_provider(config, prompt: str) -> str:
             model=config.active_model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                max_output_tokens=2048,
+                max_output_tokens=config.vlm_max_tokens * 2,
             ),
         )
         return response.text

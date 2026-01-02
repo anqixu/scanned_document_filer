@@ -22,6 +22,7 @@ class Config:
     anthropic_api_key: str | None
     openai_api_key: str | None
     gemini_api_key: str | None
+    vlm_max_tokens: int
 
     # Model Configuration
     claude_model: str
@@ -99,6 +100,14 @@ def load_config(env_path: str | Path | None = None) -> Config:
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o")
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
 
+    try:
+        vlm_max_tokens = int(os.getenv("VLM_MAX_TOKENS", "1024"))
+        if vlm_max_tokens <= 0:
+            raise ValueError("VLM_MAX_TOKENS must be positive")
+    except ValueError as e:
+        msg = f"Invalid VLM_MAX_TOKENS: {e}"
+        raise ValueError(msg) from e
+
     # Load image processing settings
     try:
         image_dpi = int(os.getenv("IMAGE_DPI", "300"))
@@ -140,6 +149,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         anthropic_api_key=anthropic_api_key,
         openai_api_key=openai_api_key,
         gemini_api_key=gemini_api_key,
+        vlm_max_tokens=vlm_max_tokens,
         claude_model=claude_model,
         openai_model=openai_model,
         gemini_model=gemini_model,

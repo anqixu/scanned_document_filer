@@ -24,6 +24,14 @@
 - Format: `logs/prompt_YYYYMMDD_HHMMSS_[filename].md`.
 - Content: Full prompt, raw JSON response, and any errors.
 
+## Prompting & Data
+
+### Layered Templates
+- **Prompt Base**: `src/data/prompt.md` acts as the structural foundation.
+- **Dynamic Context**: `src/data/context.md` provides local folder hierarchy and naming patterns.
+- **Extra Instructions**: `src/data/extra_instructions.md` provides user-specific formatting rules (e.g., date formats, naming conventions).
+- **Service Integration**: The `VLMService` must assemble these layers at runtime using placeholder replacement.
+
 ## Testing Standards
 
 - **Isolation**: Unit tests must not require active API keys or network access (use mocks).
@@ -32,7 +40,7 @@
 
 ## Configuration
 
-- **Environment-First**: All secrets and local path configurations (like `SOURCE_DIR`) go in `.env`.
+- **Environment-First**: All secrets and local path configurations (like `SOURCE_DIR` and `VLM_MAX_TOKENS`) go in `.env`.
 - **Template Sync**: Ensure `.env.template` is updated whenever a new config key is added.
 - **Fail Fast**: The application must validate required API keys and paths at startup.
 

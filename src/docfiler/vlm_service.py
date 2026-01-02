@@ -58,8 +58,9 @@ class VLMService:
             model=config.active_model,
         )
 
-        # Load prompt template
+        # Load prompt template and extra instructions
         self.prompt_template = self._load_prompt_template()
+        self.extra_instructions = self._load_extra_instructions()
 
     def analyze_document(self, file_path: str | Path) -> FilingSuggestion:
         """Analyze a document and suggest filename and destination.
@@ -100,7 +101,11 @@ class VLMService:
 
         # Send to VLM for analysis
         try:
-            response = self.client.analyze_document(prompt, images)
+            response = self.client.analyze_document(
+                prompt, 
+                images, 
+                max_tokens=self.config.vlm_max_tokens
+            )
             
             # Append response to cache
             with open(cache_file, "a", encoding="utf-8") as f:
@@ -126,12 +131,14 @@ class VLMService:
         return suggestion
 
     def _build_prompt(self) -> str:
-        """Build the complete prompt with context.
+        """Build the complete prompt with context and extra instructions.
 
         Returns:
             Complete prompt string.
         """
-        return self.prompt_template.replace("{context}", self.context)
+        prompt = self.prompt_template.replace("{context}", self.context)
+        prompt = prompt.replace("{extra_instructions}", self.extra_instructions)
+        return prompt
 
     def _load_prompt_template(self) -> str:
         """Load the prompt template from prompt.md.
@@ -149,6 +156,23 @@ class VLMService:
             logger.warning(f"Prompt template not found at {prompt_path}, using default")
             return self._get_default_prompt()
 
+    def _load_extra_instructions(self) -> str:
+        """Load extra instructions from extra_instructions.md.
+
+        Returns:
+            Extra instructions content, or empty string if not found.
+        """
+        extra_path = Path(__file__).parent.parent / "data" / "extra_instructions.md"
+
+        if extra_path.exists():
+            try:
+                with open(extra_path, encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception as e:
+                logger.error(f"Error loading extra instructions from {extra_path}: {e}")
+        
+        return ""
+
     def _get_default_prompt(self) -> str:
         """Get default prompt template if prompt.md doesn't exist.
 
@@ -159,14 +183,16 @@ class VLMService:
 
 Context: {context}
 
+{extra_instructions}
+
 Analyze the provided document image(s) and suggest:
-1. A descriptive filename (format: YYYY-MM-DD_description.ext)
+1. A descriptive filename
 2. An appropriate destination folder path
 
 Respond with JSON:
 {
-  "filename": "YYYY-MM-DD_description.ext",
-  "destination": "category/subcategory",
+  "filename": "YYYYMMDD Description.ext",
+  "destination": "Category/Subcategory",
   "confidence": 0.95,
   "reasoning": "Brief explanation"
 }
@@ -197,17 +223,17 @@ Respond with JSON:
         return """
 This is a general document filing system. Common categories include:
 
-- finances/bills (utility bills, invoices)
-- finances/statements (bank statements, credit card statements)
-- medical/records (medical records, prescriptions)
-- medical/insurance (insurance documents)
-- legal/contracts (contracts, agreements)
-- personal/correspondence (letters, notices)
-- household/manuals (product manuals, warranties)
-- taxes/receipts (tax documents, receipts)
+- Finances/Bills (Utility bills, invoices)
+- Finances/Statements (Bank statements, credit card statements)
+- Medical/Records (Medical records, prescriptions)
+- Medical/Insurance (Insurance documents)
+- Legal/Contracts (Contracts, agreements)
+- Personal/Correspondence (Letters, notices)
+- Household/Manuals (Product manuals, warranties)
+- Taxes/Receipts (Tax documents, receipts)
 
-Use YYYY-MM-DD format for dates when visible in documents.
-Use clear, descriptive names with underscores instead of spaces.
+Use YYYYMMDD format for dates when visible in documents.
+Use clear, descriptive names with Capitalized Words and spaces. Avoid underscores.
 """
 
 
