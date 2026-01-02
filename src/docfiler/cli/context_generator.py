@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -36,10 +36,10 @@ class ContextGeneratorArgs:
         max_depth: Maximum depth to traverse in folder structure
         max_files_per_dir: Maximum number of example files to show per directory
     """
-    path: str | None = None
+    path: str | None = field(default=None, positional=True)
     """Path to the folder structure to analyze (defaults to SOURCE_DIR in config)"""
     
-    output: str | None = None
+    output: str | None = field(default=None, alias="-o")
     """Output file path (defaults to src/data/context.md)"""
     
     verbose: bool = False
@@ -320,7 +320,17 @@ def main():
     scan_path = args.path or config.source_dir
     
     if not scan_path:
-        logger.error("No path provided and SOURCE_DIR not set in config/.env")
+        logger.error("No path provided as argument and SOURCE_DIR is not set in .env")
+        print("\nError: No path provided. Either:")
+        print("1. Pass a path as an argument: docfiler-context /path/to/docs")
+        print("2. Set SOURCE_DIR in your .env file")
+        sys.exit(1)
+
+    # Expand user home if needed
+    scan_path = Path(scan_path).expanduser()
+    
+    if not scan_path.exists():
+        logger.error(f"Path does not exist: {scan_path}")
         sys.exit(1)
 
     try:

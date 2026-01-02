@@ -9,6 +9,10 @@ from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfReader
+
+# Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
+Image.MAX_IMAGE_PIXELS = 200_000_000
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
@@ -120,65 +124,40 @@ class FileViewerWidget(QWidget):
         # Try to load preview for images
         if self._file_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}:
             try:
-                logger.debug(f"Loading image file: {self._file_path}")
+                logger.debug(f"Loading image file with PIL optimization: {self._file_path}")
                 
-                # Try to load with QPixmap first
-                pixmap = QPixmap(str(self._file_path))
+                # Load and downsize using PIL before converting to QPixmap
+                with Image.open(str(self._file_path)) as img:
+                    # Target a reasonable preview size (e.g., 2000px)
+                    limit = 2000
+                    
+                    # Use draft mode for JPEGs to reduce memory usage during load
+                    if img.format == "JPEG" and (img.width > limit or img.height > limit):
+                        img.draft(None, (limit, limit))
+                        
+                    # If very large, downsize now (thumbnail() is memory efficient)
+                    if img.width > limit or img.height > limit:
+                        logger.debug(f"Downsizing large image for preview: {img.width}x{img.height}")
+                        img.thumbnail((limit, limit), Image.Resampling.LANCZOS)
+                    
+                    # Convert to QPixmap
+                    pixmap = self._pil_to_qpixmap(img)
                 
-                # If QPixmap fails (e.g., image too large), use PIL to resize first
                 if pixmap.isNull():
-                    logger.debug(f"QPixmap failed, trying PIL for large image: {self._file_path}")
-                    try:
-                        # Load with PIL and resize if needed
-                        pil_img = Image.open(str(self._file_path))
-                        
-                        # Get image size
-                        width, height = pil_img.size
-                        logger.debug(f"Original image size: {width}x{height}")
-                        
-                        # Resize if too large (max 4000px on longest side)
-                        max_size = 4000
-                        if width > max_size or height > max_size:
-                            logger.debug(f"Resizing large image from {width}x{height}")
-                            if width > height:
-                                new_width = max_size
-                                new_height = int(height * (max_size / width))
-                            else:
-                                new_height = max_size
-                                new_width = int(width * (max_size / height))
-                            
-                            pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                            logger.debug(f"Resized to {new_width}x{new_height}")
-                        
-                        # Convert PIL image to QPixmap
-                        img_byte_arr = io.BytesIO()
-                        pil_img.save(img_byte_arr, format='PNG')
-                        img_byte_arr.seek(0)
-                        
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(img_byte_arr.read())
-                        
-                        if pixmap.isNull():
-                            logger.error(f"Failed to load image even after PIL resize: {self._file_path}")
-                            self.preview_label.setText(f"Could not load image\n{self._file_path.name}\n(Image may be corrupted)")
-                            return
-                    except Exception as e:
-                        logger.error(f"PIL image loading failed: {e}", exc_info=True)
-                        self.preview_label.setText(f"Could not load image\n{self._file_path.name}\n{str(e)}")
-                        return
-                
-                # Scale to fit preview
+                    raise ValueError("Failed to create QPixmap from image data")
+
+                # Scale to fit preview label size
                 scaled = pixmap.scaled(
                     self.preview_label.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
                 self.preview_label.setPixmap(scaled)
-                logger.debug(f"Successfully loaded image: {self._file_path.name}")
+                logger.debug(f"Successfully loaded image preview: {self._file_path.name}")
                 
             except Exception as e:
-                logger.error(f"Error loading image {self._file_path}: {e}", exc_info=True)
-                self.preview_label.setText(f"Error loading image\n{str(e)}")
+                logger.error(f"Image preview loading failed for {self._file_path}: {e}", exc_info=True)
+                self.preview_label.setText(f"Could not load image\n{self._file_path.name}\n{str(e)}")
 
         elif self._file_path.suffix.lower() == ".pdf":
             # For PDFs, try multiple approaches
@@ -200,12 +179,7 @@ class FileViewerWidget(QWidget):
                     if images:
                         # Convert PIL Image to QPixmap
                         img = images[0]
-                        img_byte_arr = io.BytesIO()
-                        img.save(img_byte_arr, format='PNG')
-                        img_byte_arr.seek(0)
-
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(img_byte_arr.read())
+                        pixmap = self._pil_to_qpixmap(img)
 
                         if not pixmap.isNull():
                             scaled = pixmap.scaled(
@@ -221,8 +195,6 @@ class FileViewerWidget(QWidget):
                     else:
                         logger.warning("pdf2image returned no images")
 
-                except ImportError:
-                    logger.debug("pdf2image not available, falling back to pypdf")
                 except Exception as e:
                     logger.warning(f"pdf2image failed: {e}")
 
@@ -365,6 +337,28 @@ class FileViewerWidget(QWidget):
         self.dest_edit.setText(destination)
         self.confidence_label.setText(f"Confidence: {confidence:.1%}")
         self.reasoning_label.setText(f"Reasoning: {reasoning}")
+
+    def clear_suggestion(self):
+        """Clear the current filing suggestion."""
+        self.filename_edit.clear()
+        self.dest_edit.clear()
+        self.confidence_label.setText("Confidence: -")
+        self.reasoning_label.setText("Reasoning: -")
+
+    def _pil_to_qpixmap(self, img: Image.Image) -> QPixmap:
+        """Convert PIL Image to QPixmap.
+
+        Args:
+            img: PIL Image object.
+
+        Returns:
+            QPixmap object.
+        """
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        pixmap = QPixmap()
+        pixmap.loadFromData(img_byte_arr.getvalue())
+        return pixmap
 
     def get_filename(self) -> str:
         """Get the current filename.

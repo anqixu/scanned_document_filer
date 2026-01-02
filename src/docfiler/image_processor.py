@@ -8,7 +8,14 @@ import logging
 from pathlib import Path
 
 from PIL import Image
+from pdf2image import convert_from_path
 from pypdf import PdfReader
+
+# Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
+Image.MAX_IMAGE_PIXELS = 200_000_000
+
+# Suppress noisy pypdf warnings about trailer issues
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +63,9 @@ class ImageProcessor:
             raise ValueError(msg)
 
     def process_pdf(self, pdf_path: str | Path) -> list[bytes]:
-        """Extract and process pages from a PDF.
+        """Convert PDF pages to images using pdf2image.
 
-        Extracts first, middle, and last pages and converts them to images.
+        Extracts first, middle, and last pages for context.
 
         Args:
             pdf_path: Path to the PDF file.
@@ -69,61 +76,46 @@ class ImageProcessor:
         pdf_path = Path(pdf_path)
         logger.info(f"Processing PDF: {pdf_path}")
 
-        reader = PdfReader(pdf_path)
-        num_pages = len(reader.pages)
+        try:
+            # Get page count using pypdf (lightweight)
+            reader = PdfReader(pdf_path)
+            num_pages = len(reader.pages)
+            
+            # Determine which pages to extract
+            page_indices = self._get_page_indices(num_pages)
+            logger.debug(f"Converting pages {page_indices} from {num_pages} total pages")
 
-        # Determine which pages to extract
-        page_indices = self._get_page_indices(num_pages)
-        logger.debug(f"Extracting pages {page_indices} from {num_pages} total pages")
+            images = []
+            for idx in page_indices:
+                # Convert specific page (1-indexed for pdf2image)
+                page_images = convert_from_path(
+                    pdf_path,
+                    first_page=idx + 1,
+                    last_page=idx + 1,
+                    dpi=self.target_dpi,
+                    size=(self.max_dimension, None) if self.max_dimension else None
+                )
+                
+                if page_images:
+                    img = page_images[0]
+                    # Ensure RGB
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    
+                    # Ensure max_dimension is strictly honored
+                    img = self._resize_image(img)
+                    images.append(self._image_to_bytes(img))
 
-        images = []
-        for page_idx in page_indices:
-            page = reader.pages[page_idx]
+            if not images:
+                raise ValueError("No images generated from PDF")
 
-            # Extract images from the page
-            # Note: This is a simplified approach. For better quality,
-            # consider using pdf2image library with poppler
-            if "/XObject" in page["/Resources"]:
-                x_objects = page["/Resources"]["/XObject"].get_object()
+            return images
 
-                for obj_name in x_objects:
-                    obj = x_objects[obj_name]
-
-                    if obj["/Subtype"] == "/Image":
-                        # Extract image data
-                        image_data = obj.get_data()
-                        width = obj["/Width"]
-                        height = obj["/Height"]
-
-                        # Handle different color spaces
-                        if "/ColorSpace" in obj:
-                            color_space = obj["/ColorSpace"]
-                            if color_space == "/DeviceRGB":
-                                mode = "RGB"
-                            elif color_space == "/DeviceGray":
-                                mode = "L"
-                            else:
-                                mode = "RGB"
-                        else:
-                            mode = "RGB"
-
-                        try:
-                            img = Image.frombytes(mode, (width, height), image_data)
-                            processed = self._resize_image(img)
-                            img_bytes = self._image_to_bytes(processed)
-                            images.append(img_bytes)
-                            break  # Take first image from page
-                        except Exception as e:
-                            logger.warning(f"Failed to extract image from page {page_idx}: {e}")
-
-        # If no images were extracted, create a placeholder
-        if not images:
-            logger.warning(f"No images extracted from PDF: {pdf_path}")
-            # Create a simple placeholder image
-            placeholder = Image.new("RGB", (100, 100), color="white")
-            images.append(self._image_to_bytes(placeholder))
-
-        return images
+        except Exception as e:
+            logger.error(f"Failed to process PDF {pdf_path}: {e}")
+            # Fallback to a single blank page with error message if needed, 
+            # but better to let it propagate or return empty list
+            raise
 
     def process_image(self, image_path: str | Path) -> list[bytes]:
         """Process a single image file.
@@ -137,7 +129,12 @@ class ImageProcessor:
         image_path = Path(image_path)
         logger.info(f"Processing image: {image_path}")
 
+        # Open image lazily
         img = Image.open(image_path)
+        
+        # Use draft mode for JPEGs to downsize during load if possible
+        if img.format == "JPEG" and (img.width > self.max_dimension or img.height > self.max_dimension):
+            img.draft(None, (self.max_dimension, self.max_dimension))
 
         # Convert to RGB if necessary
         if img.mode not in ("RGB", "L"):
@@ -145,6 +142,10 @@ class ImageProcessor:
 
         processed = self._resize_image(img)
         img_bytes = self._image_to_bytes(processed)
+
+        # Close image to free resources
+        if hasattr(img, "close"):
+            img.close()
 
         return [img_bytes]
 
@@ -179,24 +180,12 @@ class ImageProcessor:
         """
         width, height = img.size
 
-        # Calculate scaling factor
-        if width > height:
-            if width > self.max_dimension:
-                scale = self.max_dimension / width
-                new_width = self.max_dimension
-                new_height = int(height * scale)
-            else:
-                return img
-        else:
-            if height > self.max_dimension:
-                scale = self.max_dimension / height
-                new_height = self.max_dimension
-                new_width = int(width * scale)
-            else:
-                return img
-
-        logger.debug(f"Resizing image from {width}x{height} to {new_width}x{new_height}")
-        return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        if width > self.max_dimension or height > self.max_dimension:
+            logger.debug(f"Downsizing image from {width}x{height} to max {self.max_dimension}")
+            # thumbnail() is more memory efficient than resize()
+            img.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
+        
+        return img
 
     def _image_to_bytes(self, img: Image.Image) -> bytes:
         """Convert PIL Image to bytes in PNG format.

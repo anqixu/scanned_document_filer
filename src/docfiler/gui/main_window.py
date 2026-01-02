@@ -159,15 +159,15 @@ class MainWindow(QMainWindow):
         left_panel.addLayout(selection_layout)
 
         # Processing controls
-        process_button = QPushButton("Process All Files")
-        process_button.clicked.connect(self._process_all)
-        left_panel.addWidget(process_button)
+        self.process_button = QPushButton("Process All Files")
+        self.process_button.clicked.connect(self._process_all)
+        left_panel.addWidget(self.process_button)
 
         # Context generation
-        context_button = QPushButton("Generate Filing Context")
-        context_button.setToolTip("Analyze organized documents to update filing conventions")
-        context_button.clicked.connect(self._generate_context)
-        left_panel.addWidget(context_button)
+        self.context_button = QPushButton("Generate Filing Context")
+        self.context_button.setToolTip("Analyze organized documents to update filing conventions")
+        self.context_button.clicked.connect(self._generate_context)
+        left_panel.addWidget(self.context_button)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -290,6 +290,12 @@ class MainWindow(QMainWindow):
                     suggestion.confidence,
                     suggestion.reasoning,
                 )
+            else:
+                # It might be an Exception or None
+                self.file_viewer.clear_suggestion()
+        else:
+            # No suggestion at all for this file
+            self.file_viewer.clear_suggestion()
 
     def _process_all(self):
         """Process all files in the list."""
@@ -297,8 +303,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Files", "Please open a folder first.")
             return
 
-        # Disable UI during processing
-        self.setEnabled(False)
+        # Disable only action buttons during processing
+        self.process_button.setEnabled(False)
+        self.context_button.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(len(self.files))
         self.progress_bar.setValue(0)
@@ -329,6 +336,7 @@ class MainWindow(QMainWindow):
         """
         if isinstance(result, Exception):
             logger.error(f"Error processing {file_path}: {result}")
+            self.suggestions[file_path] = result  # Store exception to signal failure
             # Mark as error in the list
             for i in range(self.file_list_model.rowCount()):
                 item = self.file_list_model.item(i)
@@ -360,7 +368,8 @@ class MainWindow(QMainWindow):
     def _on_processing_finished(self):
         """Handle processing completion."""
         self.progress_bar.setVisible(False)
-        self.setEnabled(True)
+        self.process_button.setEnabled(True)
+        self.context_button.setEnabled(True)
 
         QMessageBox.information(
             self,
