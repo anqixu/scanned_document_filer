@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from ..config import load_config
 from ..vlm_service import FilingSuggestion, create_vlm_service
+from ..cli.context_generator import generate_context
 from .file_viewer import FileViewerWidget
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,35 @@ class ProcessingThread(QThread):
             self.progress.emit(idx, total)
 
         self.finished.emit()
+
+
+class ContextGenerationThread(QThread):
+    """Background thread for generating filing context."""
+
+    finished = pyqtSignal(object)  # result (str) or exception
+
+    def __init__(self, source_path):
+        """Initialize the thread.
+
+        Args:
+            source_path: Path to the organized document repository.
+        """
+        super().__init__()
+        self.source_path = source_path
+
+    def run(self):
+        """Run the context generation."""
+        try:
+            # Run with default parameters from CLI
+            context = generate_context(
+                self.source_path,
+                max_depth=8,
+                max_files_per_dir=100
+            )
+            self.finished.emit(context)
+        except Exception as e:
+            logger.error(f"Error generating context: {e}")
+            self.finished.emit(e)
 
 
 class MainWindow(QMainWindow):
@@ -132,6 +162,12 @@ class MainWindow(QMainWindow):
         process_button = QPushButton("Process All Files")
         process_button.clicked.connect(self._process_all)
         left_panel.addWidget(process_button)
+
+        # Context generation
+        context_button = QPushButton("Generate Filing Context")
+        context_button.setToolTip("Analyze organized documents to update filing conventions")
+        context_button.clicked.connect(self._generate_context)
+        left_panel.addWidget(context_button)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -503,6 +539,74 @@ class MainWindow(QMainWindow):
             current_folder = self.files[0].parent if self.files else None
             if current_folder:
                 self._load_folder(str(current_folder))
+
+    def _generate_context(self):
+        """Generate filing context from the organized documents directory."""
+        if not self.config or not self.config.source_dir:
+            QMessageBox.warning(
+                self,
+                "Configuration Missing",
+                "SOURCE_DIR is not set in your .env file. Please set it to your organized documents root."
+            )
+            return
+
+        source_path = Path(self.config.source_dir)
+        if not source_path.exists():
+            QMessageBox.critical(
+                self,
+                "Directory Not Found",
+                f"SOURCE_DIR does not exist: {source_path}"
+            )
+            return
+
+        # Confirm with user
+        reply = QMessageBox.question(
+            self,
+            "Confirm Context Generation",
+            f"This will scan {source_path} and use an LLM to update your filing conventions.\n\n"
+            "This may take a minute and will consume API tokens.\n\n"
+            "Do you want to continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Disable UI
+        self.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+
+        # Start thread
+        self.context_thread = ContextGenerationThread(source_path)
+        self.context_thread.finished.connect(self._on_context_generated)
+        self.context_thread.start()
+
+    def _on_context_generated(self, result):
+        """Handle completion of context generation."""
+        self.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+        if isinstance(result, Exception):
+            QMessageBox.critical(
+                self,
+                "Context Generation Failed",
+                f"An error occurred while generating context:\n{result}"
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Context Updated",
+                "Filing context has been successfully updated and saved to src/data/context.md.\n\n"
+                "The new conventions will be used for future document analysis."
+            )
+            
+            # Refresh VLM service with new context
+            try:
+                self.vlm_service = create_vlm_service(self.config)
+                logger.info("VLM service refreshed with new context")
+            except Exception as e:
+                logger.error(f"Failed to refresh VLM service: {e}")
 
 
 
