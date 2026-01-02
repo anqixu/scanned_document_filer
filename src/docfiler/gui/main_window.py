@@ -622,7 +622,8 @@ class MainWindow(QMainWindow):
                 continue
 
             file_path = Path(file_path_str)
-            base_dir = self.config.default_dest_base or file_path.parent
+            # Prioritize source_dir as the base for moving organized files
+            base_dir = self.config.source_dir or self.config.default_dest_base or file_path.parent
 
             # Construct destination path
             dest_dir = Path(base_dir) / suggestion.destination
