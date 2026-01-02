@@ -7,8 +7,8 @@ import io
 import logging
 from pathlib import Path
 
-from PIL import Image
 from pdf2image import convert_from_path
+from PIL import Image
 from pypdf import PdfReader
 
 # Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
@@ -80,7 +80,7 @@ class ImageProcessor:
             # Get page count using pypdf (lightweight)
             reader = PdfReader(pdf_path)
             num_pages = len(reader.pages)
-            
+
             # Determine which pages to extract
             page_indices = self._get_page_indices(num_pages)
             logger.debug(f"Converting pages {page_indices} from {num_pages} total pages")
@@ -95,13 +95,13 @@ class ImageProcessor:
                     dpi=self.target_dpi,
                     size=(self.max_dimension, None) if self.max_dimension else None
                 )
-                
+
                 if page_images:
                     img = page_images[0]
                     # Ensure RGB
                     if img.mode != "RGB":
                         img = img.convert("RGB")
-                    
+
                     # Ensure max_dimension is strictly honored
                     img = self._resize_image(img)
                     images.append(self._image_to_bytes(img))
@@ -113,7 +113,7 @@ class ImageProcessor:
 
         except Exception as e:
             logger.error(f"Failed to process PDF {pdf_path}: {e}")
-            # Fallback to a single blank page with error message if needed, 
+            # Fallback to a single blank page with error message if needed,
             # but better to let it propagate or return empty list
             raise
 
@@ -131,7 +131,7 @@ class ImageProcessor:
 
         # Open image lazily
         img = Image.open(image_path)
-        
+
         # Use draft mode for JPEGs to downsize during load if possible
         if img.format == "JPEG" and (img.width > self.max_dimension or img.height > self.max_dimension):
             img.draft(None, (self.max_dimension, self.max_dimension))
@@ -184,7 +184,7 @@ class ImageProcessor:
             logger.debug(f"Downsizing image from {width}x{height} to max {self.max_dimension}")
             # thumbnail() is more memory efficient than resize()
             img.thumbnail((self.max_dimension, self.max_dimension), Image.Resampling.LANCZOS)
-        
+
         return img
 
     def _image_to_bytes(self, img: Image.Image) -> bytes:

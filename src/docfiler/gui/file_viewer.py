@@ -13,6 +13,7 @@ from pypdf import PdfReader
 # Support high-resolution scans by increasing the decompression bomb limit (approx 200MP)
 Image.MAX_IMAGE_PIXELS = 200_000_000
 
+from pdf2image import convert_from_path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
@@ -26,8 +27,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from pdf2image import convert_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +60,11 @@ class FileViewerWidget(QWidget):
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area.setStyleSheet("QScrollArea { background-color: #f0f0f0; border: 1px solid #ccc; }")
         self.scroll_area.setMinimumSize(400, 400)
-        
+
         self.preview_label = QLabel("No file selected")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        
+
         self.scroll_area.setWidget(self.preview_label)
         layout.addWidget(self.scroll_area)
 
@@ -97,12 +96,12 @@ class FileViewerWidget(QWidget):
         self.dest_edit.setPlaceholderText("Suggested destination will appear here")
         self.dest_edit.textChanged.connect(self._on_destination_changed)
         dest_layout.addWidget(self.dest_edit)
-        
+
         # Add browse button
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self._on_browse_clicked)
         dest_layout.addWidget(self.browse_button)
-        
+
         info_layout.addLayout(dest_layout)
 
         # Confidence and reasoning
@@ -159,24 +158,24 @@ class FileViewerWidget(QWidget):
         if self._file_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}:
             try:
                 logger.debug(f"Loading image file with PIL optimization: {self._file_path}")
-                
+
                 # Load and downsize using PIL before converting to QPixmap
                 with Image.open(str(self._file_path)) as img:
                     # Target a reasonable preview size (e.g., 2000px)
                     limit = 2000
-                    
+
                     # Use draft mode for JPEGs to reduce memory usage during load
                     if img.format == "JPEG" and (img.width > limit or img.height > limit):
                         img.draft(None, (limit, limit))
-                        
+
                     # If very large, downsize now (thumbnail() is memory efficient)
                     if img.width > limit or img.height > limit:
                         logger.debug(f"Downsizing large image for preview: {img.width}x{img.height}")
                         img.thumbnail((limit, limit), Image.Resampling.LANCZOS)
-                    
+
                     # Convert to QPixmap
                     pixmap = self._pil_to_qpixmap(img)
-                
+
                 if pixmap.isNull():
                     raise ValueError("Failed to create QPixmap from image data")
 
@@ -185,7 +184,7 @@ class FileViewerWidget(QWidget):
                 self._fit_to_view = True
                 self._update_preview()
                 logger.debug(f"Successfully loaded image preview: {self._file_path.name}")
-                
+
             except Exception as e:
                 logger.error(f"Image preview loading failed for {self._file_path}: {e}", exc_info=True)
                 self.preview_label.setText(f"Could not load image\n{self._file_path.name}\n{str(e)}")
@@ -250,7 +249,7 @@ class FileViewerWidget(QWidget):
                                         height = int(obj['/Height'])
                                         data = obj.get_data()
                                         color_space = obj.get('/ColorSpace', '/DeviceRGB')
-                                        
+
                                         if color_space == '/DeviceRGB':
                                             mode = "RGB"
                                         elif color_space == '/DeviceGray':
@@ -263,7 +262,7 @@ class FileViewerWidget(QWidget):
                                         img = Image.frombytes(mode, (width, height), data)
                                         if mode == "CMYK":
                                             img = img.convert("RGB")
-                                        
+
                                         pixmap = self._pil_to_qpixmap(img)
                                         if not pixmap.isNull():
                                             self._full_pixmap = pixmap
@@ -292,84 +291,10 @@ class FileViewerWidget(QWidget):
                 self.preview_label.setText(f"Could not load PDF preview.\n{str(e)}")
                 self._full_pixmap = QPixmap()
         else:
-            self.preview_label.setText("Unsupported file type")
-            self._full_pixmap = QPixmap()
-                                            expected_size = width * height * 4
-                                        else:
-                                            # Try RGB as default
-                                            mode = "RGB"
-                                            expected_size = width * height * 3
-
-                                        logger.debug(f"Image properties: {width}x{height}, mode={mode}, bits={bits_per_component}, data_size={len(data)}, expected={expected_size}")
-                                        
-                                        # Check if we have enough data
-                                        if len(data) < expected_size:
-                                            logger.warning(f"Not enough image data for {obj_name}: got {len(data)} bytes, expected {expected_size}")
-                                            continue
-
-                                        # Create PIL Image
-                                        try:
-                                            img = Image.frombytes(mode, (width, height), data[:expected_size])
-                                            
-                                            # Convert CMYK to RGB if needed
-                                            if mode == "CMYK":
-                                                img = img.convert("RGB")
-                                        except Exception as e:
-                                            logger.warning(f"Failed to create image from bytes for {obj_name}: {e}")
-                                            continue
-
-                                        # Convert to QPixmap
-                                        img_byte_arr = io.BytesIO()
-                                        img.save(img_byte_arr, format='PNG')
-                                        img_byte_arr.seek(0)
-
-                                        pixmap = QPixmap()
-                                        pixmap.loadFromData(img_byte_arr.read())
-
-                                        if not pixmap.isNull():
-                                            scaled = pixmap.scaled(
-                                                self.preview_label.size(),
-                                                Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.SmoothTransformation,
-                                            )
-                                            self.preview_label.setPixmap(scaled)
-                                            images_found = True
-                                            logger.debug(f"Successfully extracted image from PDF: {self._file_path.name}")
-                                            break
-                                        else:
-                                            logger.warning("Extracted image produced null pixmap")
-
-                                    except Exception as e:
-                                        logger.warning(f"Failed to extract image {obj_name}: {e}")
-                                        continue
-                    except Exception as e:
-                        logger.warning(f"Error accessing PDF XObjects: {e}")
-
-                    if not images_found:
-                        # Final fallback: show PDF info
-                        page_count = len(pdf_reader.pages)
-                        info_text = (
-                            f"PDF Document\n{self._file_path.name}\n\n"
-                            f"{page_count} page{'s' if page_count != 1 else ''}\n\n"
-                            f"(Preview not available)\n\n"
-                            f"For PDF previews, install:\n"
-                            f"pip install pdf2image\n"
-                            f"sudo apt install poppler-utils"
-                        )
-                        self.preview_label.setText(info_text)
-                        logger.info(f"Showing PDF info for: {self._file_path.name} ({page_count} pages) - preview not available")
-                else:
-                    self.preview_label.setText("Empty PDF")
-                    logger.warning(f"PDF has no pages: {self._file_path}")
-
-            except Exception as e:
-                error_msg = f"Could not load PDF: {str(e)}"
-                logger.error(f"Error loading PDF {self._file_path}: {e}", exc_info=True)
-                self.preview_label.setText(f"{error_msg}\n{self._file_path.name}")
-        else:
             # For other file types, show placeholder
             logger.debug(f"Unsupported file type: {self._file_path.suffix}")
             self.preview_label.setText(f"File: {self._file_path.name}\n(Preview not available)")
+            self._full_pixmap = QPixmap()
 
 
     def set_suggestion(
@@ -477,7 +402,7 @@ class FileViewerWidget(QWidget):
             start_dir = Path.home()
         else:
             start_dir = Path(start_dir)
-            
+
         current_dest = self.dest_edit.text().strip()
         if current_dest:
             potential_path = start_dir / current_dest
@@ -502,7 +427,7 @@ class FileViewerWidget(QWidget):
                 except ValueError:
                     # Not relative to source_dir
                     pass
-            
+
             # Fallback to full path
             self.dest_edit.setText(str(folder_path))
 

@@ -57,6 +57,7 @@ processed_documents/
 
 # Private filing context
 src/data/context.md
+src/data/source_scanned_results.txt
 
 # Logs and cached prompts
 logs/

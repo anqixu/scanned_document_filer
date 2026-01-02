@@ -83,14 +83,14 @@ class VLMService:
 
         # Build prompt with context
         prompt = self._build_prompt()
-        
+
         # Cache prompt to logs/
         log_dir = Path(__file__).parent.parent.parent / "logs"
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_filename = "".join(x for x in file_path.name if x.isalnum() or x in "._- ")
         cache_file = log_dir / f"prompt_{timestamp}_{safe_filename}.md"
-        
+
         with open(cache_file, "w", encoding="utf-8") as f:
             f.write(f"# Prompt Cache: {file_path.name}\n\n")
             f.write(f"**Timestamp**: {datetime.now().isoformat()}\n")
@@ -102,11 +102,11 @@ class VLMService:
         # Send to VLM for analysis
         try:
             response = self.client.analyze_document(
-                prompt, 
-                images, 
+                prompt,
+                images,
                 max_tokens=self.config.vlm_max_tokens
             )
-            
+
             # Append response to cache
             with open(cache_file, "a", encoding="utf-8") as f:
                 f.write("## Response\n\n")
@@ -170,7 +170,7 @@ class VLMService:
                     return f.read().strip()
             except Exception as e:
                 logger.error(f"Error loading extra instructions from {extra_path}: {e}")
-        
+
         return ""
 
     def _get_default_prompt(self) -> str:
@@ -208,7 +208,7 @@ Respond with JSON:
         """
         # Look for context.md in the data directory
         context_path = Path(__file__).parent.parent / "data" / "context.md"
-        
+
         if context_path.exists():
             try:
                 with open(context_path, encoding="utf-8") as f:

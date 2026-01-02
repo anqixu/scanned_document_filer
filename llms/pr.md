@@ -17,8 +17,9 @@ Document Filer is an AI-powered application that organizes scanned documents usi
 - **Multi-Provider VLM**: Supports Claude (Anthropic), GPT-4 (OpenAI), and Gemini (Google).
 - **Context-Aware**: Learns filing conventions from your existing folder structure.
 - **Reasoning**: Provides a brief explanation for every filename and destination suggestion.
-- **Configurable Limits**: API token limits (`VLM_MAX_TOKENS`) are externalized to `.env` for easy tuning.
 - **Extra Instructions**: Customizable `extra_instructions.md` for fine-tuning AI formatting (e.g., date formats, casing).
+- **Token Safety**: Built-in limits on the number of folders analyzed during context generation to stay within LLM context windows.
+- **Directory Blacklisting**: Configurable `SCAN_IGNORE_PATTERNS` to skip irrelevant or sensitive folders (e.g., `.git`, `node_modules`).
 
 ### 3. Desktop GUI (PyQt6)
 - **Batch Processing**: Process multiple files simultaneously with progress tracking.
@@ -53,7 +54,8 @@ scanned_document_filer/
 │   └── data/                  # Shared data (Git ignored)
 │       ├── prompt.md          # Global VLM prompt template
 │       ├── context.md         # Local filing conventions
-│       └── extra_instructions.md # Fine-grained formatting rules
+│       ├── extra_instructions.md # Fine-grained formatting rules
+│       └── source_scanned_results.txt # Raw scan audit log
 ├── logs/                      # Audit trail & prompt caches (Git ignored)
 ├── tests/                     # Unit test suite
 └── pyproject.toml             # Dependencies & packaging

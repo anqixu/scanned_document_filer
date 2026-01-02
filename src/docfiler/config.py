@@ -37,6 +37,7 @@ class Config:
     # File Organization
     source_dir: str | None
     default_dest_base: str | None
+    scan_ignore_patterns: list[str]
 
     # Logging
     log_level: str
@@ -137,6 +138,10 @@ def load_config(env_path: str | Path | None = None) -> Config:
     source_dir = os.getenv("SOURCE_DIR") or None
     default_dest_base = os.getenv("DEFAULT_DEST_BASE") or None
 
+    # Load scan ignore patterns (comma-separated regex)
+    ignore_raw = os.getenv("SCAN_IGNORE_PATTERNS", "")
+    scan_ignore_patterns = [p.strip() for p in ignore_raw.split(",") if p.strip()]
+
     # Load logging configuration
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     valid_log_levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -158,6 +163,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         pdf_pages_to_extract=pdf_pages_to_extract,
         source_dir=source_dir,
         default_dest_base=default_dest_base,
+        scan_ignore_patterns=scan_ignore_patterns,
         log_level=log_level,
     )
 

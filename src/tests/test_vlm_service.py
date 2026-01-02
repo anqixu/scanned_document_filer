@@ -39,12 +39,17 @@ class TestVLMService:
             image_dpi=300,
             max_image_dimension=2048,
             pdf_pages_to_extract=3,
+            vlm_max_tokens=1024,
+            source_dir=None,
+            scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
         )
 
-    def test_get_default_context(self):
+    @patch("docfiler.vlm_service.Path.exists")
+    def test_get_default_context(self, mock_exists):
         """Test default context generation."""
+        mock_exists.return_value = False  # Force fallback
         service = VLMService(self.config)
         context = service._get_default_context()
 
@@ -154,6 +159,9 @@ class TestVLMServiceIntegration:
             image_dpi=300,
             max_image_dimension=2048,
             pdf_pages_to_extract=3,
+            vlm_max_tokens=1024,
+            source_dir=None,
+            scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
         )

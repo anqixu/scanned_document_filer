@@ -113,9 +113,9 @@ class TestGeminiClient:
     @patch("docfiler.api_clients.genai")
     def test_analyze_document(self, mock_genai):
         """Test document analysis with Gemini."""
-        # Setup mock
-        mock_model = Mock()
-        mock_genai.GenerativeModel.return_value = mock_model
+        # Setup mock for the new google-genai SDK structure
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
 
         mock_response = Mock()
         mock_response.text = json.dumps({
@@ -124,7 +124,7 @@ class TestGeminiClient:
             "confidence": 0.85,
             "reasoning": "Gemini reasoning",
         })
-        mock_model.generate_content.return_value = mock_response
+        mock_client.models.generate_content.return_value = mock_response
 
         # Test
         client = GeminiClient("test_key", "gemini-2.0-flash-exp")
@@ -132,7 +132,7 @@ class TestGeminiClient:
 
         assert result["filename"] == "gemini_test.pdf"
         assert result["destination"] == "test_dir"
-        assert mock_model.generate_content.called
+        assert mock_client.models.generate_content.called
 
 
 class TestCreateClient:

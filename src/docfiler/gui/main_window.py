@@ -11,8 +11,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QStandardItemModel, QStandardItem
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -26,9 +26,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..cli.context_generator import generate_context
 from ..config import load_config
 from ..vlm_service import FilingSuggestion, create_vlm_service
-from ..cli.context_generator import generate_context
 from .file_viewer import FileViewerWidget
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class CheckableListView(QListView):
 
     def mousePressEvent(self, event):
         index = self.indexAt(event.pos())
-        
+
         if not index.isValid():
             super().mousePressEvent(event)
             return
@@ -53,17 +53,17 @@ class CheckableListView(QListView):
             model = self.model()
             if model and hasattr(model, "itemFromIndex"):
                 target_item = model.itemFromIndex(index)
-                
+
                 # Capture state before super()
                 old_state = target_item.checkState()
-                
+
                 # Let super process (handles selection and potential toggle)
                 super().mousePressEvent(event)
-                
+
                 # Get state after super()
                 new_state = target_item.checkState()
-                
-                # If clicking the text (no toggle happened), we force a toggle 
+
+                # If clicking the text (no toggle happened), we force a toggle
                 # based on the last item's state or just invert.
                 if new_state == old_state:
                     new_state = Qt.CheckState.Unchecked if old_state == Qt.CheckState.Checked else Qt.CheckState.Checked
@@ -71,13 +71,13 @@ class CheckableListView(QListView):
 
                 start_row = min(self.last_index.row(), index.row())
                 end_row = max(self.last_index.row(), index.row())
-                
+
                 # Apply new state to the whole range
                 for row in range(start_row, end_row + 1):
                     item = model.item(row)
                     if item:
                         item.setCheckState(new_state)
-                
+
                 self.last_index = index
                 return
 
@@ -251,7 +251,7 @@ class MainWindow(QMainWindow):
 
             # Create VLM service
             self.vlm_service = create_vlm_service(self.config)
-            
+
             # Update file viewer with source dir
             if self.config.source_dir:
                 self.file_viewer.source_dir = self.config.source_dir
@@ -309,7 +309,7 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(str(file_path), Qt.ItemDataRole.UserRole)  # Store full path
             self.file_list_model.appendRow(item)
-            
+
             # Pre-populate with current filename by default
             self.suggestions[str(file_path)] = FilingSuggestion(
                 filename=file_path.name,
@@ -332,7 +332,7 @@ class MainWindow(QMainWindow):
         """
         if not current.isValid():
             return
-        
+
         row = current.row()
         if row < 0 or row >= len(self.files):
             return
@@ -476,7 +476,7 @@ class MainWindow(QMainWindow):
         # Log summary instead of a popup
         success_count = sum(1 for s in self.suggestions.values() if isinstance(s, FilingSuggestion))
         error_count = sum(1 for s in self.suggestions.values() if isinstance(s, Exception))
-        
+
         logger.info(f"Processing Complete: {success_count} successful, {error_count} failed")
 
     def _select_all_files(self):
@@ -543,7 +543,7 @@ class MainWindow(QMainWindow):
 
         # Prepare state migration for successful renames
         migrated_suggestions = {}
-        
+
         for file_path_str, suggestion in selected:
             file_path = Path(file_path_str)
             new_path = file_path.parent / suggestion.filename
@@ -556,7 +556,7 @@ class MainWindow(QMainWindow):
 
                 file_path.rename(new_path)
                 logger.info(f"Renamed {file_path_str} -> {new_path}")
-                
+
                 # Keep the suggestion but update it for the new path
                 # Also mark as successfully renamed for state migration
                 migrated_suggestions[str(new_path)] = suggestion
@@ -576,10 +576,10 @@ class MainWindow(QMainWindow):
             for old_path, suggestion in selected:
                 if str(Path(old_path).parent / suggestion.filename) in migrated_suggestions:
                     self.suggestions.pop(old_path, None)
-            
+
             # Merge migrated suggestions back
             self.suggestions.update(migrated_suggestions)
-            
+
             # Force a re-scan of the folder to update self.files and the list model
             # but preserve our current self.suggestions
             current_folder = self.files[0].parent if self.files else None
@@ -680,7 +680,7 @@ class MainWindow(QMainWindow):
             item.setCheckable(True)
             item.setCheckState(Qt.CheckState.Checked)
             item.setData(file_str, Qt.ItemDataRole.UserRole)
-            
+
             # Mark processed/state
             if file_str in self.suggestions:
                 res = self.suggestions[file_str]
@@ -696,7 +696,7 @@ class MainWindow(QMainWindow):
                     confidence=1.0,
                     reasoning="Refreshed"
                 )
-            
+
             self.file_list_model.appendRow(item)
 
         if self.files:
@@ -765,7 +765,7 @@ class MainWindow(QMainWindow):
                 "Filing context has been successfully updated and saved to src/data/context.md.\n\n"
                 "The new conventions will be used for future document analysis."
             )
-            
+
             # Refresh VLM service with new context
             try:
                 self.vlm_service = create_vlm_service(self.config)
@@ -791,7 +791,7 @@ def main():
     # Configure logging to both file and console
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    
+
     log_filename = os.path.join(
         log_dir,
         f"docfiler_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -834,9 +834,9 @@ def main():
         """Handle Ctrl-C gracefully."""
         logger.info("Received interrupt signal, shutting down gracefully...")
         app.quit()
-    
+
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     # Allow Ctrl-C to work by setting up a timer to process events
     # This is needed because Qt event loop blocks signal handling
     timer = app.startTimer(500)  # Check for signals every 500ms

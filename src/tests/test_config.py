@@ -24,6 +24,9 @@ class TestConfig:
             image_dpi=300,
             max_image_dimension=2048,
             pdf_pages_to_extract=3,
+            vlm_max_tokens=1024,
+            source_dir=None,
+            scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
         )
@@ -43,6 +46,9 @@ class TestConfig:
             image_dpi=300,
             max_image_dimension=2048,
             pdf_pages_to_extract=3,
+            vlm_max_tokens=1024,
+            source_dir=None,
+            scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
         )
@@ -63,6 +69,9 @@ class TestConfig:
             image_dpi=300,
             max_image_dimension=2048,
             pdf_pages_to_extract=3,
+            vlm_max_tokens=1024,
+            source_dir=None,
+            scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
         )
