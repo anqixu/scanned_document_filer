@@ -42,6 +42,9 @@ class Config:
     # Logging
     log_level: str
 
+    # Parallelism
+    vlm_max_parallel: int
+
     @property
     def active_api_key(self) -> str:
         """Get the API key for the active provider."""
@@ -149,6 +152,13 @@ def load_config(env_path: str | Path | None = None) -> Config:
         msg = f"Invalid LOG_LEVEL: {log_level}. Must be one of {valid_log_levels}"
         raise ValueError(msg)
 
+    try:
+        vlm_max_parallel = int(os.getenv("VLM_MAX_PARALLEL", "1"))
+        if vlm_max_parallel < 1:
+            raise ValueError("VLM_MAX_PARALLEL must be >= 1")
+    except ValueError as e:
+        raise ValueError(f"Invalid VLM_MAX_PARALLEL: {e}") from e
+
     config = Config(
         vlm_provider=vlm_provider,
         anthropic_api_key=anthropic_api_key,
@@ -165,6 +175,7 @@ def load_config(env_path: str | Path | None = None) -> Config:
         default_dest_base=default_dest_base,
         scan_ignore_patterns=scan_ignore_patterns,
         log_level=log_level,
+        vlm_max_parallel=vlm_max_parallel,
     )
 
     # Validate that the selected provider has an API key

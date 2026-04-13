@@ -26,15 +26,83 @@ brew install poppler
 ```
 
 ### Setup
-```bash
-git clone <repository-url>
-cd scanned_document_filer
-python -m venv venv
-source venv/bin/activate
-pip install -e "."
-cp .env.template .env
-```
+
+**Note: Never create a `venv` inside the project directory.** Always use a centralized virtual environment, specifically at `$HOME/venv/local/` (or `%USERPROFILE%\venv\local\` on Windows).
+
+1. Clone the repository and navigate to it:
+   ```bash
+   git clone <repository-url>
+   cd scanned_document_filer
+   ```
+
+2. Activate your central virtual environment. If it doesn't exist, create it first:
+
+   **Linux / macOS:**
+   ```bash
+   # Create if it doesn't exist
+   mkdir -p ~/venv
+   python3 -m venv ~/venv/local
+
+   # Activate
+   source ~/venv/local/bin/activate
+   ```
+
+   **Windows (Command Prompt / PowerShell):**
+   ```powershell
+   # Create if it doesn't exist
+   New-Item -ItemType Directory -Force -Path "$HOME\venv"
+   python -m venv "$HOME\venv\local"
+
+   # Activate
+   & "$HOME\venv\local\Scripts\Activate.ps1"
+   ```
+
+3. Install dependencies and set up `.env` file:
+   ```bash
+   pip install -e "."
+   cp .env.template .env
+   # Depending on your terminal in Windows, you may need to use:
+   # copy .env.template .env
+   ```
 *Configure your API keys and `SOURCE_DIR` in `.env`.*
+
+### WSL2 with X410 (Windows)
+
+The GUI (`docfiler-gui`) requires an X display server on WSL2. [X410](https://x410.dev/) is a recommended option.
+
+**1. Install required packages in WSL2:**
+```bash
+sudo apt-get install libxcb-xinerama0 libxcb-cursor0 libgl1
+```
+
+**2. Launch X410** on Windows in *"Windowed Apps"* or *"Desktop"* mode.
+Enable *"Allow Public Access"* in X410 settings (or accept the firewall rule prompt).
+
+**3. Set the `DISPLAY` variable in WSL2:**
+
+For X410 with default WSL2 (NAT networking):
+```bash
+export DISPLAY=$(grep -m1 nameserver /etc/resolv.conf | awk '{print $2}'):0
+```
+
+For Windows 11 / WSL2 with mirrored networking (`networkingMode=mirrored` in `.wslconfig`):
+```bash
+export DISPLAY=localhost:0
+```
+
+Add the appropriate line to your `~/.bashrc` or `~/.zshrc` so it persists.
+
+**4. Verify the display works:**
+```bash
+xdpyinfo | head -5   # should print display info without errors
+```
+
+**5. Run the GUI:**
+```bash
+docfiler-gui
+```
+
+The application auto-detects `DISPLAY` and sets `QT_QPA_PLATFORM=xcb` accordingly — no extra Qt flags needed.
 
 ## Usage
 

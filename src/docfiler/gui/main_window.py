@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..api_clients import classify_api_error
+from ..cache_manager import CacheManager, create_cache_manager
 from ..cli.context_generator import generate_context
 from ..config import load_config
 from ..vlm_service import FilingSuggestion, create_vlm_service
@@ -92,30 +95,37 @@ class ProcessingThread(QThread):
     file_processed = pyqtSignal(str, object)  # file_path, suggestion (or exception)
     finished = pyqtSignal()
 
-    def __init__(self, files, vlm_service):
+    def __init__(self, files, vlm_service, max_parallel: int = 1):
         """Initialize the processing thread.
 
         Args:
             files: List of file paths to process.
             vlm_service: VLM service instance.
+            max_parallel: Number of concurrent LLM calls.
         """
         super().__init__()
         self.files = files
         self.vlm_service = vlm_service
+        self.max_parallel = max_parallel
 
     def run(self):
         """Run the processing in background."""
         total = len(self.files)
-
-        for idx, file_path in enumerate(self.files, 1):
-            try:
-                suggestion = self.vlm_service.analyze_document(file_path)
-                self.file_processed.emit(str(file_path), suggestion)
-            except Exception as e:
-                self.file_processed.emit(str(file_path), e)
-
-            self.progress.emit(idx, total)
-
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
+            future_to_path = {
+                executor.submit(self.vlm_service.analyze_document, fp): fp
+                for fp in self.files
+            }
+            for future in as_completed(future_to_path):
+                fp = future_to_path[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = e
+                self.file_processed.emit(str(fp), result)
+                completed += 1
+                self.progress.emit(completed, total)
         self.finished.emit()
 
 
@@ -156,6 +166,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = None
         self.vlm_service = None
+        self.cache_manager: CacheManager | None = None
+        self.file_hashes: dict[str, str] = {}  # str(file_path) → sha256 hex
         self.files = []
         self.suggestions = {}  # file_path -> FilingSuggestion
         self.current_file_index = -1
@@ -249,8 +261,9 @@ class MainWindow(QMainWindow):
             self.config = load_config()
             logger.info(f"Configuration loaded: Provider={self.config.vlm_provider}")
 
-            # Create VLM service
-            self.vlm_service = create_vlm_service(self.config)
+            # Create cache manager and VLM service
+            self.cache_manager = create_cache_manager()
+            self.vlm_service = create_vlm_service(self.config, cache_manager=self.cache_manager)
 
             # Update file viewer with source dir
             if self.config.source_dir:
@@ -310,13 +323,35 @@ class MainWindow(QMainWindow):
             item.setData(str(file_path), Qt.ItemDataRole.UserRole)  # Store full path
             self.file_list_model.appendRow(item)
 
-            # Pre-populate with current filename by default
-            self.suggestions[str(file_path)] = FilingSuggestion(
-                filename=file_path.name,
-                destination="",
-                confidence=1.0,
-                reasoning="Current state"
-            )
+            file_str = str(file_path)
+            cache_hit = False
+            if self.cache_manager:
+                try:
+                    file_hash = self.cache_manager.compute_hash(file_path)
+                    self.file_hashes[file_str] = file_hash
+                    cached = self.cache_manager.get_cached_result(file_hash)
+                    if cached:
+                        _images, suggestion, gui_state = cached
+                        if gui_state:
+                            suggestion = FilingSuggestion(
+                                filename=gui_state["filename"],
+                                destination=gui_state["destination"],
+                                confidence=suggestion.confidence,
+                                reasoning=suggestion.reasoning,
+                            )
+                        self.suggestions[file_str] = suggestion
+                        item.setText(f"✓ {file_path.name}")
+                        cache_hit = True
+                except Exception as e:
+                    logger.warning("Cache lookup failed for %s: %s", file_path.name, e)
+
+            if not cache_hit:
+                self.suggestions[file_str] = FilingSuggestion(
+                    filename=file_path.name,
+                    destination="",
+                    confidence=1.0,
+                    reasoning="Current state"
+                )
 
         if self.files:
             # Select first item
@@ -374,6 +409,7 @@ class MainWindow(QMainWindow):
                     confidence=1.0,
                     reasoning="Manual override"
                 )
+            self._save_gui_state_to_cache(file_path)
 
     def _on_viewer_destination_changed(self, text):
         """Handle manual destination changes in the viewer."""
@@ -389,6 +425,22 @@ class MainWindow(QMainWindow):
                     confidence=1.0,
                     reasoning="Manual override"
                 )
+            self._save_gui_state_to_cache(file_path)
+
+    def _save_gui_state_to_cache(self, file_path_str: str) -> None:
+        """Persist current filename/destination edits to the cache entry."""
+        if not self.cache_manager:
+            return
+        suggestion = self.suggestions.get(file_path_str)
+        if not isinstance(suggestion, FilingSuggestion):
+            return
+        file_hash = self.file_hashes.get(file_path_str)
+        if not file_hash:
+            return
+        try:
+            self.cache_manager.save_gui_state(file_hash, suggestion.filename, suggestion.destination)
+        except Exception as e:
+            logger.warning("Failed to save gui_state: %s", e)
 
     def _process_selected(self):
         """Process only the checked files in the list."""
@@ -404,6 +456,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Selection", "Please check at least one file to process.")
             return
 
+        # Skip files that already have a valid cache entry
+        if self.cache_manager:
+            uncached = [
+                fp for fp in checked_files
+                if not self.cache_manager.has_entry(self.file_hashes.get(str(fp), ""))
+            ]
+            skipped = len(checked_files) - len(uncached)
+            if skipped:
+                logger.info("Skipping %d cached file(s), processing %d", skipped, len(uncached))
+            if not uncached:
+                QMessageBox.information(
+                    self, "All Cached",
+                    f"All {skipped} selected file(s) already have results.\n"
+                    "Delete cache/ to force reprocessing."
+                )
+                return
+            checked_files = uncached
+
         # Disable only action buttons during processing
         # The user can still browse and select files
         self.process_button.setEnabled(False)
@@ -413,7 +483,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
         # Start processing thread
-        self.processing_thread = ProcessingThread(checked_files, self.vlm_service)
+        self.processing_thread = ProcessingThread(
+            checked_files, self.vlm_service, max_parallel=self.config.vlm_max_parallel
+        )
         self.processing_thread.progress.connect(self._on_progress)
         self.processing_thread.file_processed.connect(self._on_file_processed)
         self.processing_thread.finished.connect(self._on_processing_finished)
@@ -437,7 +509,9 @@ class MainWindow(QMainWindow):
             result: FilingSuggestion or Exception.
         """
         if isinstance(result, Exception):
-            logger.error(f"Error processing {file_path}: {result}")
+            provider = self.config.vlm_provider if self.config else "unknown"
+            msg = classify_api_error(provider, result)
+            logger.error(f"Error processing {file_path}: {msg}")
             self.suggestions[file_path] = result  # Store exception to signal failure
             # Mark as error in the list
             for i in range(self.file_list_model.rowCount()):
@@ -754,11 +828,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
 
         if isinstance(result, Exception):
-            QMessageBox.critical(
-                self,
-                "Context Generation Failed",
-                f"An error occurred while generating context:\n{result}"
-            )
+            provider = self.config.vlm_provider if self.config else "unknown"
+            msg = classify_api_error(provider, result)
+            QMessageBox.critical(self, "Context Generation Failed", msg)
         else:
             QMessageBox.information(
                 self,
@@ -769,7 +841,7 @@ class MainWindow(QMainWindow):
 
             # Refresh VLM service with new context
             try:
-                self.vlm_service = create_vlm_service(self.config)
+                self.vlm_service = create_vlm_service(self.config, cache_manager=self.cache_manager)
                 logger.info("VLM service refreshed with new context")
             except Exception as e:
                 logger.error(f"Failed to refresh VLM service: {e}")

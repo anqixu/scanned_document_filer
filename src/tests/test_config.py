@@ -29,6 +29,7 @@ class TestConfig:
             scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
+            vlm_max_parallel=1,
         )
 
         assert config.active_api_key == "test_claude_key"
@@ -51,6 +52,7 @@ class TestConfig:
             scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
+            vlm_max_parallel=1,
         )
 
         with pytest.raises(ValueError, match="API key not configured"):
@@ -74,6 +76,7 @@ class TestConfig:
             scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
+            vlm_max_parallel=1,
         )
 
         assert config.active_model == "gpt-4o"

@@ -20,7 +20,7 @@ from openai import OpenAI
 from simple_parsing import ArgumentParser, field
 from tqdm import tqdm
 
-from ..api_clients import create_client
+from ..api_clients import classify_api_error, create_client
 from ..config import load_config
 
 logger = logging.getLogger(__name__)
@@ -357,6 +357,48 @@ def _generate_with_provider(config, prompt: str) -> str:
         raise ValueError(msg)
 
 
+def smoke_test_provider(config) -> None:
+    """Quick connectivity check for the configured LLM provider.
+
+    Makes a minimal API call to verify the key and network are working
+    before starting the (potentially slow) directory scan.
+
+    Args:
+        config: Application configuration.
+
+    Raises:
+        RuntimeError: If the provider cannot be reached.
+    """
+    provider = config.vlm_provider
+    logger.info(f"Smoke-testing LLM provider: {provider} ({config.active_model})")
+
+    try:
+        if provider == "claude":
+            client = anthropic.Anthropic(api_key=config.active_api_key)
+            client.messages.create(
+                model=config.active_model,
+                max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        elif provider == "openai":
+            client = OpenAI(api_key=config.active_api_key)
+            client.chat.completions.create(
+                model=config.active_model,
+                max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        elif provider == "gemini":
+            client = genai.Client(api_key=config.active_api_key)
+            client.models.generate_content(
+                model=config.active_model,
+                contents="ping",
+                config=types.GenerateContentConfig(max_output_tokens=5),
+            )
+        logger.info("LLM provider smoke test passed.")
+    except Exception as e:
+        raise RuntimeError(classify_api_error(provider, e)) from e
+
+
 def main():
     """Main entry point for the context generator CLI."""
     parser = ArgumentParser(description="Generate filing context from an existing folder structure")
@@ -391,6 +433,15 @@ def main():
 
     # Load config to get default source_dir
     config = load_config()
+
+    # Smoke-test the provider BEFORE the directory scan to fail fast on bad API keys
+    try:
+        smoke_test_provider(config)
+    except RuntimeError as e:
+        logger.error(str(e))
+        print(f"\nError: {e}")
+        sys.exit(1)
+
     scan_path = args.path or config.source_dir
 
     if not scan_path:

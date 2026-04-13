@@ -6,6 +6,7 @@ This module provides a unified interface to Claude, OpenAI, and Gemini APIs.
 import base64
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 
 import anthropic
@@ -13,6 +14,37 @@ from google import genai
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+
+def classify_api_error(provider: str, exc: Exception) -> str:
+    """Return a short, actionable error message for a provider API exception.
+
+    Args:
+        provider: Provider name ('claude', 'openai', 'gemini').
+        exc: The exception raised by the provider SDK.
+
+    Returns:
+        Human-readable error string with actionable advice.
+    """
+    s = str(exc)
+
+    if any(x in s for x in ("401", "403", "invalid_api_key", "Unauthorized", "PERMISSION_DENIED", "API key not valid")):
+        return f"{provider}: invalid API key — check {provider.upper()}_API_KEY in .env"
+
+    if "400" in s and "usage limit" in s.lower():
+        m = re.search(r"regain access on ([^.'\"]+)", s)
+        suffix = f" (access resumes {m.group(1).strip()})" if m else ""
+        return f"{provider}: account spending limit reached{suffix}"
+
+    if "429" in s or "quota" in s.lower() or "RESOURCE_EXHAUSTED" in s or "insufficient_quota" in s:
+        m = re.search(r"retry[^\d]*(\d+)\s*s", s, re.IGNORECASE)
+        suffix = f" — retry in {m.group(1)}s" if m else ""
+        return f"{provider}: quota/rate limit exceeded{suffix} — check billing at provider dashboard"
+
+    if any(x in s.lower() for x in ("connection", "timeout", "network", "resolve", "unreachable")):
+        return f"{provider}: network error — check internet connection"
+
+    return f"{provider}: {s.splitlines()[0][:150]}"
 
 
 class VLMClient(ABC):

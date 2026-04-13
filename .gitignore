@@ -61,3 +61,6 @@ src/data/source_scanned_results.txt
 
 # Logs and cached prompts
 logs/
+
+# Document analysis cache
+cache/

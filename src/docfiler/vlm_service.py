@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .api_clients import create_client
+from .cache_manager import CacheManager
 from .config import Config
 from .image_processor import ImageProcessor
 
@@ -35,15 +36,17 @@ class FilingSuggestion:
 class VLMService:
     """Service for analyzing documents and suggesting filing locations."""
 
-    def __init__(self, config: Config, context: str | None = None):
+    def __init__(self, config: Config, context: str | None = None, cache_manager: CacheManager | None = None):
         """Initialize the VLM service.
 
         Args:
             config: Application configuration.
             context: Optional context about folder structure and filing conventions.
+            cache_manager: Optional cache manager for result persistence.
         """
         self.config = config
         self.context = context or self._get_default_context()
+        self.cache_manager = cache_manager
 
         # Initialize image processor
         self.image_processor = ImageProcessor(
@@ -77,6 +80,19 @@ class VLMService:
         file_path = Path(file_path)
         logger.info(f"Analyzing document: {file_path}")
 
+        # Cache lookup
+        file_hash = None
+        if self.cache_manager:
+            try:
+                file_hash = self.cache_manager.compute_hash(file_path)
+                cached = self.cache_manager.get_cached_result(file_hash)
+                if cached is not None:
+                    _images, suggestion, _gui_state = cached
+                    logger.info(f"Cache hit for {file_path.name}")
+                    return suggestion
+            except Exception as e:
+                logger.warning(f"Cache lookup failed for {file_path.name}: {e}")
+
         # Process document to images
         images = self.image_processor.process_document(file_path)
         logger.debug(f"Extracted {len(images)} image(s) from document")
@@ -87,7 +103,7 @@ class VLMService:
         # Cache prompt to logs/
         log_dir = Path(__file__).parent.parent.parent / "logs"
         os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_filename = "".join(x for x in file_path.name if x.isalnum() or x in "._- ")
         cache_file = log_dir / f"prompt_{timestamp}_{safe_filename}.md"
 
@@ -126,6 +142,13 @@ class VLMService:
             confidence=response.get("confidence", 0.0),
             reasoning=response.get("reasoning", "No reasoning provided"),
         )
+
+        # Save to cache
+        if self.cache_manager and file_hash:
+            try:
+                self.cache_manager.save_result(file_hash, file_path.name, images, suggestion)
+            except Exception as e:
+                logger.warning(f"Cache save failed for {file_path.name}: {e}")
 
         logger.info(f"Suggestion: {suggestion}")
         return suggestion
@@ -237,12 +260,17 @@ Use clear, descriptive names with Capitalized Words and spaces. Avoid underscore
 """
 
 
-def create_vlm_service(config: Config, context_path: str | Path | None = None) -> VLMService:
+def create_vlm_service(
+    config: Config,
+    context_path: str | Path | None = None,
+    cache_manager: CacheManager | None = None,
+) -> VLMService:
     """Factory function to create a VLM service.
 
     Args:
         config: Application configuration.
         context_path: Optional path to a context file.
+        cache_manager: Optional cache manager for result persistence.
 
     Returns:
         Initialized VLMService.
@@ -257,4 +285,4 @@ def create_vlm_service(config: Config, context_path: str | Path | None = None) -
         else:
             logger.warning(f"Context file not found: {context_path}")
 
-    return VLMService(config, context)
+    return VLMService(config, context, cache_manager=cache_manager)

@@ -44,6 +44,7 @@ class TestVLMService:
             scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
+            vlm_max_parallel=1,
         )
 
     @patch("docfiler.vlm_service.Path.exists")
@@ -164,6 +165,7 @@ class TestVLMServiceIntegration:
             scan_ignore_patterns=[],
             default_dest_base=None,
             log_level="INFO",
+            vlm_max_parallel=1,
         )
 
         service = VLMService(config)
