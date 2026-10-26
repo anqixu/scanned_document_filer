@@ -1,18 +1,20 @@
 """Content-addressed disk cache for document analysis results.
 
-Cache layout (project_root/cache/):
-  {sha256}.json          — metadata + suggestion + gui_state
-  {sha256}_page0.png     — extracted page images
-  {sha256}_page1.png
-  ...
+Layout: cache/{sha256}.json holding the VLM suggestion plus any GUI edits
+("gui_state"), keyed by the SHA-256 of the file content so entries survive
+renames.
 """
 
 import hashlib
 import json
 import logging
 import os
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .config import CACHE_DIR
+from .models import FilingSuggestion
 
 logger = logging.getLogger(__name__)
 
@@ -24,135 +26,77 @@ class CacheManager:
         self.cache_dir = cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def compute_hash(self, file_path: Path) -> str:
-        """SHA-256 of full file content (64 KB chunks)."""
+    @staticmethod
+    def compute_hash(file_path: Path) -> str:
+        """SHA-256 of full file content."""
         h = hashlib.sha256()
         with open(file_path, "rb") as f:
-            while chunk := f.read(65536):
+            while chunk := f.read(1 << 20):
                 h.update(chunk)
         return h.hexdigest()
 
-    def has_entry(self, file_hash: str) -> bool:
-        """Return True if a JSON cache entry exists for this hash."""
-        if not file_hash:
-            return False
-        return (self.cache_dir / f"{file_hash}.json").exists()
+    def _path(self, file_hash: str) -> Path:
+        return self.cache_dir / f"{file_hash}.json"
 
-    def get_cached_result(
-        self, file_hash: str
-    ):
-        """Return (images, suggestion, gui_state) or None if miss/corrupt.
+    def has_entry(self, file_hash: str | None) -> bool:
+        """Return True if a cache entry exists for this hash."""
+        return bool(file_hash) and self._path(file_hash).exists()
 
-        images is a list[bytes], suggestion is a FilingSuggestion-like dict,
-        gui_state is a dict or None.
-        """
+    def get_cached_result(self, file_hash: str) -> FilingSuggestion | None:
+        """Return the cached suggestion with any GUI edits applied, or None on miss/corruption."""
+        path = self._path(file_hash)
+        if not path.exists():
+            return None
         try:
-            json_path = self.cache_dir / f"{file_hash}.json"
-            if not json_path.exists():
-                return None
-
-            with open(json_path, encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Import here to avoid circular imports
-            from .vlm_service import FilingSuggestion
-
-            suggestion_data = data["suggestion"]
-            suggestion = FilingSuggestion(
-                filename=suggestion_data["filename"],
-                destination=suggestion_data["destination"],
-                confidence=suggestion_data["confidence"],
-                reasoning=suggestion_data["reasoning"],
-            )
-
-            # Load images
-            image_count = data.get("image_count", 0)
-            images = []
-            for i in range(image_count):
-                img_path = self.cache_dir / f"{file_hash}_page{i}.png"
-                if img_path.exists():
-                    images.append(img_path.read_bytes())
-
-            gui_state = data.get("gui_state")
-            return images, suggestion, gui_state
-
+            data = json.loads(path.read_text(encoding="utf-8"))
+            suggestion = FilingSuggestion(**data["suggestion"])
+            if gui_state := data.get("gui_state"):
+                suggestion.filename = gui_state["filename"]
+                suggestion.destination = gui_state["destination"]
+            return suggestion
         except Exception as e:
             logger.warning("Cache read failed for %s: %s", file_hash, e)
             return None
 
-    def save_result(
-        self,
-        file_hash: str,
-        original_filename: str,
-        images: list,
-        suggestion,
-    ) -> None:
-        """Write images then JSON atomically.
+    def save_result(self, file_hash: str, original_filename: str, suggestion: FilingSuggestion) -> None:
+        """Store a fresh VLM suggestion (clears any previous GUI edits)."""
+        data = {
+            "file_hash": file_hash,
+            "original_filename": original_filename,
+            "cached_at": _now(),
+            "suggestion": asdict(suggestion),
+            "gui_state": None,
+        }
+        self._write(file_hash, data)
 
-        Images are written first; if interrupted, the absent JSON means
-        the partial entry is ignored on next read.
-        """
+    def save_gui_state(self, file_hash: str, filename: str, destination: str) -> None:
+        """Record user edits on an existing entry (no-op if there is no entry)."""
+        path = self._path(file_hash)
+        if not path.exists():
+            return
         try:
-            # Write images first
-            for i, img_bytes in enumerate(images):
-                img_path = self.cache_dir / f"{file_hash}_page{i}.png"
-                self._atomic_write_bytes(img_path, img_bytes)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("gui_state save failed for %s: %s", file_hash, e)
+            return
+        data["gui_state"] = {"filename": filename, "destination": destination, "updated_at": _now()}
+        self._write(file_hash, data)
 
-            # Write JSON
-            data = {
-                "file_hash": file_hash,
-                "original_filename": original_filename,
-                "cached_at": datetime.now(timezone.utc).isoformat(),
-                "image_count": len(images),
-                "suggestion": {
-                    "filename": suggestion.filename,
-                    "destination": suggestion.destination,
-                    "confidence": suggestion.confidence,
-                    "reasoning": suggestion.reasoning,
-                },
-                "gui_state": None,
-            }
-            json_path = self.cache_dir / f"{file_hash}.json"
-            self._atomic_write_json(json_path, data)
-
+    def _write(self, file_hash: str, data: dict) -> None:
+        """Atomic write: temp file then os.replace()."""
+        target = self._path(file_hash)
+        tmp = target.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(tmp, target)
         except Exception as e:
             logger.warning("Cache write failed for %s: %s", file_hash, e)
 
-    def save_gui_state(self, file_hash: str, filename: str, destination: str) -> None:
-        """Overwrite gui_state in existing JSON entry."""
-        try:
-            json_path = self.cache_dir / f"{file_hash}.json"
-            if not json_path.exists():
-                return
 
-            with open(json_path, encoding="utf-8") as f:
-                data = json.load(f)
-
-            data["gui_state"] = {
-                "filename": filename,
-                "destination": destination,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._atomic_write_json(json_path, data)
-
-        except Exception as e:
-            logger.warning("gui_state save failed for %s: %s", file_hash, e)
-
-    def _atomic_write_bytes(self, target: Path, data: bytes) -> None:
-        """Write to .tmp then os.replace() — atomic on POSIX and Windows/DrvFs."""
-        tmp = target.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
-
-    def _atomic_write_json(self, target: Path, data: dict) -> None:
-        """Same pattern for JSON."""
-        tmp = target.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, target)
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def create_cache_manager() -> CacheManager:
-    """Create a CacheManager rooted at project_root/cache/."""
-    cache_dir = Path(__file__).parent.parent.parent / "cache"
-    return CacheManager(cache_dir)
+    """Create a CacheManager rooted at the project cache/ directory."""
+    return CacheManager(CACHE_DIR)

@@ -1,28 +1,43 @@
 """Main window for Document Filer GUI.
 
-This module provides the main application window with file browsing and
-batch processing capabilities.
+File table (checkbox, suggested name, confidence) on the left, preview/suggestion
+editor on the right.
+Analysis and context generation run in background threads.
 """
 
+import filecmp
 import logging
 import os
+import shutil
 import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import (
+    QMessageLogContext,
+    Qt,
+    QThread,
+    QTimer,
+    QtMsgType,
+    pyqtSignal,
+    qInstallMessageHandler,
+)
 from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
-    QListView,
+    QHeaderView,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -30,15 +45,37 @@ from PyQt6.QtWidgets import (
 from ..api_clients import classify_api_error
 from ..cache_manager import CacheManager, create_cache_manager
 from ..cli.context_generator import generate_context
-from ..config import load_config
-from ..vlm_service import FilingSuggestion, create_vlm_service
+from ..config import CLI_PROVIDERS, PROVIDERS, Config, load_config, setup_logging
+from ..image_processor import list_documents
+from ..models import FilingSuggestion
+from ..vlm_service import VLMService, create_vlm_service
 from .file_viewer import FileViewerWidget
 
 logger = logging.getLogger(__name__)
 
+PATH_ROLE = Qt.ItemDataRole.UserRole
+COL_FILE, COL_NEW_NAME, COL_CONFIDENCE = range(3)
+COLUMN_TITLES = ("File", "New Name", "Conf.")
 
-class CheckableListView(QListView):
-    """QListView that supports shift-click for mass checkbox toggling."""
+
+def unique_path(target: Path) -> Path:
+    """Return target, or 'stem (2).ext', 'stem (3).ext', ... if it already exists."""
+    candidate, n = target, 2
+    while candidate.exists():
+        candidate = target.with_name(f"{target.stem} ({n}){target.suffix}")
+        n += 1
+    return candidate
+
+
+def display_name(suggestion: FilingSuggestion) -> str:
+    """Suggested 'destination/filename' (just the filename when not moving)."""
+    if not suggestion.destination:
+        return suggestion.filename
+    return f"{suggestion.destination.rstrip('/')}/{suggestion.filename}"
+
+
+class CheckableTableView(QTableView):
+    """QTableView where shift-click toggles the column-0 checkboxes for a whole range."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,882 +83,556 @@ class CheckableListView(QListView):
 
     def mousePressEvent(self, event):
         index = self.indexAt(event.pos())
-
-        if not index.isValid():
+        model = self.model()
+        shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        if not (index.isValid() and shift and self.last_index is not None and self.last_index.isValid()):
             super().mousePressEvent(event)
+            if index.isValid():
+                self.last_index = index
             return
 
-        # Check if shift is held and we have a previous index
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and self.last_index is not None:
-            model = self.model()
-            if model and hasattr(model, "itemFromIndex"):
-                target_item = model.itemFromIndex(index)
-
-                # Capture state before super()
-                old_state = target_item.checkState()
-
-                # Let super process (handles selection and potential toggle)
-                super().mousePressEvent(event)
-
-                # Get state after super()
-                new_state = target_item.checkState()
-
-                # If clicking the text (no toggle happened), we force a toggle
-                # based on the last item's state or just invert.
-                if new_state == old_state:
-                    new_state = Qt.CheckState.Unchecked if old_state == Qt.CheckState.Checked else Qt.CheckState.Checked
-                    target_item.setCheckState(new_state)
-
-                start_row = min(self.last_index.row(), index.row())
-                end_row = max(self.last_index.row(), index.row())
-
-                # Apply new state to the whole range
-                for row in range(start_row, end_row + 1):
-                    item = model.item(row)
-                    if item:
-                        item.setCheckState(new_state)
-
-                self.last_index = index
-                return
-
+        target = model.item(index.row(), COL_FILE)
+        old_state = target.checkState()
         super().mousePressEvent(event)
+        new_state = target.checkState()
+        if new_state == old_state:  # clicked the text, not the box: toggle anyway
+            new_state = Qt.CheckState.Unchecked if old_state == Qt.CheckState.Checked else Qt.CheckState.Checked
+
+        lo, hi = sorted((self.last_index.row(), index.row()))
+        for row in range(lo, hi + 1):
+            model.item(row, COL_FILE).setCheckState(new_state)
         self.last_index = index
 
 
 class ProcessingThread(QThread):
-    """Background thread for processing documents."""
+    """Analyzes documents in the background; emits one result per file."""
 
-    progress = pyqtSignal(int, int)  # current, total
-    file_processed = pyqtSignal(str, object)  # file_path, suggestion (or exception)
-    finished = pyqtSignal()
+    file_processed = pyqtSignal(str, object)  # file path, FilingSuggestion or Exception
 
-    def __init__(self, files, vlm_service, max_parallel: int = 1):
-        """Initialize the processing thread.
-
-        Args:
-            files: List of file paths to process.
-            vlm_service: VLM service instance.
-            max_parallel: Number of concurrent LLM calls.
-        """
+    def __init__(self, files: list[Path], vlm_service: VLMService, max_parallel: int = 1):
         super().__init__()
         self.files = files
         self.vlm_service = vlm_service
         self.max_parallel = max_parallel
 
     def run(self):
-        """Run the processing in background."""
-        total = len(self.files)
-        completed = 0
         with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
-            future_to_path = {
-                executor.submit(self.vlm_service.analyze_document, fp): fp
-                for fp in self.files
-            }
-            for future in as_completed(future_to_path):
-                fp = future_to_path[future]
+            futures = {executor.submit(self.vlm_service.analyze_document, fp): fp for fp in self.files}
+            for future in as_completed(futures):
                 try:
                     result = future.result()
                 except Exception as e:
                     result = e
-                self.file_processed.emit(str(fp), result)
-                completed += 1
-                self.progress.emit(completed, total)
-        self.finished.emit()
+                self.file_processed.emit(str(futures[future]), result)
 
 
 class ContextGenerationThread(QThread):
-    """Background thread for generating filing context."""
+    """Generates filing context in the background."""
 
-    finished = pyqtSignal(object)  # result (str) or exception
+    result = pyqtSignal(object)  # context str or Exception
 
-    def __init__(self, source_path):
-        """Initialize the thread.
-
-        Args:
-            source_path: Path to the organized document repository.
-        """
+    def __init__(self, source_path: Path, config: Config):
         super().__init__()
         self.source_path = source_path
+        self.config = config
 
     def run(self):
-        """Run the context generation."""
         try:
-            # Run with default parameters from CLI
-            context = generate_context(
-                self.source_path,
-                max_depth=8,
-                max_files_per_dir=100
-            )
-            self.finished.emit(context)
+            self.result.emit(generate_context(self.source_path, self.config))
         except Exception as e:
             logger.error(f"Error generating context: {e}")
-            self.finished.emit(e)
+            self.result.emit(e)
 
 
 class MainWindow(QMainWindow):
     """Main application window."""
 
     def __init__(self):
-        """Initialize the main window."""
         super().__init__()
-        self.config = None
-        self.vlm_service = None
+        self.config: Config | None = None
+        self.vlm_service: VLMService | None = None
         self.cache_manager: CacheManager | None = None
-        self.file_hashes: dict[str, str] = {}  # str(file_path) → sha256 hex
-        self.files = []
-        self.suggestions = {}  # file_path -> FilingSuggestion
+        self.current_folder: Path | None = None
+        self.files: list[Path] = []
+        self.suggestions: dict[str, FilingSuggestion | Exception] = {}  # str(path) -> result
+        self.file_hashes: dict[str, str] = {}  # str(path) -> sha256
         self.current_file_index = -1
-        self.processing_thread = None
+        self.processing_thread: ProcessingThread | None = None
+        self.context_thread: ContextGenerationThread | None = None
+        self._batch_done = 0
+        self._batch_errors = 0
 
         self._init_ui()
         self._load_config()
 
-        # Automatically load default directory if it exists
-        default_dir = Path.home() / "GDrive" / "SHARED" / "__IN__"
-        if default_dir.exists() and default_dir.is_dir():
-            self._load_folder(str(default_dir))
+        if self.config.input_dir and Path(self.config.input_dir).is_dir():
+            self._load_folder(Path(self.config.input_dir))
+
+    # --- setup -----------------------------------------------------------------
 
     def _init_ui(self):
-        """Initialize the user interface."""
         self.setWindowTitle("Document Filer")
         self.setMinimumSize(1000, 700)
-
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
-
-        # Main layout
         main_layout = QHBoxLayout(central)
+        left_panel = QWidget()
+        left = QVBoxLayout(left_panel)
+        left.setContentsMargins(0, 0, 0, 0)
 
-        # Left panel - file list
-        left_panel = QVBoxLayout()
+        def button(text: str, slot, tooltip: str = "") -> QPushButton:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            b.setToolTip(tooltip)
+            return b
 
-        # Folder selection
-        folder_button = QPushButton("Open Folder...")
-        folder_button.clicked.connect(self._open_folder)
-        left_panel.addWidget(folder_button)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItems(PROVIDERS)
+        self.provider_combo.setToolTip(
+            "claude-cli / codex-cli use your logged-in Claude Code / Codex CLI "
+            "(subscription); the others use API keys from .env"
+        )
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
+        provider_row.addWidget(self.provider_combo, 1)
+        left.addLayout(provider_row)
 
-        # File list with checkboxes
-        self.file_list_model = QStandardItemModel()
-        self.file_list = CheckableListView()
+        self.open_button = button("Open Folder...", self._open_folder)
+        left.addWidget(self.open_button)
+
+        self.file_list_model = QStandardItemModel(0, len(COLUMN_TITLES))
+        self.file_list_model.setHorizontalHeaderLabels(COLUMN_TITLES)
+        self.file_list = CheckableTableView()
         self.file_list.setModel(self.file_list_model)
-        self.file_list.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        self.file_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.file_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideRight)  # overflow keeps the start visible
+        self.file_list.setWordWrap(False)
+        self.file_list.verticalHeader().setVisible(False)
+        self.file_list.verticalHeader().setDefaultSectionSize(self.fontMetrics().height() + 8)
+        header = self.file_list.horizontalHeader()
+        header.setSectionResizeMode(COL_FILE, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(COL_NEW_NAME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_CONFIDENCE, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_list.setColumnWidth(COL_FILE, 180)
         self.file_list.selectionModel().currentChanged.connect(self._on_file_selected)
-        left_panel.addWidget(self.file_list)
+        left.addWidget(self.file_list)
 
-        # Right panel - file viewer
-        self.file_viewer = FileViewerWidget()
-        self.file_viewer.filename_changed.connect(self._on_viewer_filename_changed)
-        self.file_viewer.destination_changed.connect(self._on_viewer_destination_changed)
-        main_layout.addWidget(self.file_viewer, 2)
-        selection_layout = QHBoxLayout()
-        select_all_button = QPushButton("Select All")
-        select_all_button.clicked.connect(self._select_all_files)
-        selection_layout.addWidget(select_all_button)
+        selection_row = QHBoxLayout()
+        selection_row.addWidget(button("Select All", lambda: self._set_all_checked(True)))
+        selection_row.addWidget(button("Select None", lambda: self._set_all_checked(False)))
+        left.addLayout(selection_row)
 
-        select_none_button = QPushButton("Select None")
-        select_none_button.clicked.connect(self._select_no_files)
-        selection_layout.addWidget(select_none_button)
-        left_panel.addLayout(selection_layout)
-
-        # Processing controls
-        self.process_button = QPushButton("Process Selected Files")
-        self.process_button.clicked.connect(self._process_selected)
-        left_panel.addWidget(self.process_button)
-
-        # Context generation
-        self.context_button = QPushButton("Generate Filing Context")
-        self.context_button.setToolTip("Analyze organized documents to update filing conventions")
-        self.context_button.clicked.connect(self._generate_context)
-        left_panel.addWidget(self.context_button)
-
-        # Progress bar
+        self.process_button = button("Process Selected Files", self._process_selected)
+        self.context_button = button(
+            "Generate Filing Context", self._generate_context,
+            "Analyze organized documents to update filing conventions",
+        )
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        left_panel.addWidget(self.progress_bar)
+        self.rename_button = button("Rename Selected Files (in place)", lambda: self._execute(move=False))
+        self.move_button = button("Rename and Move Selected Files", lambda: self._execute(move=True))
+        for w in (self.process_button, self.context_button, self.progress_bar, self.rename_button, self.move_button):
+            left.addWidget(w)
 
-        # Execute buttons - separate rename and move
-        execute_layout = QVBoxLayout()
+        self.file_viewer = FileViewerWidget()
+        self.file_viewer.filename_changed.connect(lambda text: self._on_viewer_edited(filename=text))
+        self.file_viewer.destination_changed.connect(lambda text: self._on_viewer_edited(destination=text))
 
-        rename_button = QPushButton("Rename Selected Files (in place)")
-        rename_button.clicked.connect(self._execute_rename)
-        execute_layout.addWidget(rename_button)
-
-        move_button = QPushButton("Rename and Move Selected Files")
-        move_button.clicked.connect(self._execute_move)
-        execute_layout.addWidget(move_button)
-
-        left_panel.addLayout(execute_layout)
-
-        main_layout.addLayout(left_panel, 1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(self.file_viewer)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([600, 600])
+        main_layout.addWidget(splitter)
 
     def _load_config(self):
-        """Load application configuration."""
+        """Load configuration and create services; exit on failure."""
         try:
             self.config = load_config()
-            logger.info(f"Configuration loaded: Provider={self.config.vlm_provider}")
-
-            # Create cache manager and VLM service
             self.cache_manager = create_cache_manager()
             self.vlm_service = create_vlm_service(self.config, cache_manager=self.cache_manager)
-
-            # Update file viewer with source dir
-            if self.config.source_dir:
-                self.file_viewer.source_dir = self.config.source_dir
-
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
             QMessageBox.critical(
-                self,
-                "Configuration Error",
-                f"Failed to load configuration:\n{e}\n\nPlease check your .env file.",
+                self, "Configuration Error", f"Failed to load configuration:\n{e}\n\nPlease check your .env file."
             )
             sys.exit(1)
 
+        logger.info(f"Configuration loaded: Provider={self.config.vlm_provider}")
+        self.file_viewer.dest_base = self.config.dest_base
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.setCurrentText(self.config.vlm_provider)
+        self.provider_combo.blockSignals(False)
+
+    def _on_provider_changed(self, provider: str):
+        """Switch the VLM provider; revert the dropdown if it is not usable."""
+        try:
+            config = self.config.with_provider(provider)
+            service = create_vlm_service(config, cache_manager=self.cache_manager)
+        except Exception as e:
+            hint = "" if provider in CLI_PROVIDERS else "\n\nAdd the API key to .env and restart."
+            QMessageBox.warning(self, "Provider Unavailable", f"Cannot use {provider}:\n{e}{hint}")
+            self.provider_combo.blockSignals(True)
+            self.provider_combo.setCurrentText(self.config.vlm_provider)
+            self.provider_combo.blockSignals(False)
+            return
+        self.config, self.vlm_service = config, service
+        logger.info(f"Switched provider to {provider} ({config.active_model or 'CLI default model'})")
+
+    def _set_busy(self, busy: bool):
+        """Disable actions that must not run concurrently with background work."""
+        for w in (self.process_button, self.context_button, self.rename_button,
+                  self.move_button, self.open_button, self.provider_combo):
+            w.setEnabled(not busy)
+
+    # --- folder & list -----------------------------------------------------------
+
     def _open_folder(self):
-        """Open folder selection dialog."""
-        # Default to ~/GDrive/SHARED/__IN__ directory
-        default_dir = str(Path.home() / "GDrive" / "SHARED" / "__IN__")
-
+        start = self.current_folder or self.config.input_dir or str(Path.home())
         folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Folder with Documents",
-            default_dir,
-            QFileDialog.Option.ShowDirsOnly,
+            self, "Select Folder with Documents", str(start), QFileDialog.Option.ShowDirsOnly
         )
-
         if folder:
-            self._load_folder(folder)
+            self._load_folder(Path(folder))
 
-    def _load_folder(self, folder_path: str):
-        """Load files from a folder.
-
-        Args:
-            folder_path: Path to the folder.
-        """
-        folder = Path(folder_path)
+    def _load_folder(self, folder: Path):
+        """(Re)load the file list, keeping in-memory results and restoring cached ones."""
         logger.info(f"Loading folder: {folder}")
+        self.current_folder = folder
+        self.files = list_documents(folder)
+        self.file_list_model.removeRows(0, self.file_list_model.rowCount())
+        self.file_list.last_index = None
 
-        # Find all supported files
-        patterns = ["*.pdf", "*.png", "*.jpg", "*.jpeg", "*.tiff", "*.tif", "*.bmp"]
-        self.files = []
-
-        for pattern in patterns:
-            self.files.extend(folder.glob(pattern))
-
-        logger.info(f"Found {len(self.files)} files")
-
-        # Update file list
-        self.file_list_model.clear()
-        self.suggestions.clear()
-        self.file_list.last_index = None  # Reset shift-click starting point
-
-        for file_path in self.files:
-            item = QStandardItem(file_path.name)
+        for path in self.files:
+            key = str(path)
+            item = QStandardItem(path.name)
             item.setCheckable(True)
             item.setCheckState(Qt.CheckState.Checked)
-            item.setData(str(file_path), Qt.ItemDataRole.UserRole)  # Store full path
-            self.file_list_model.appendRow(item)
+            item.setData(key, PATH_ROLE)
+            item.setToolTip(path.name)
+            confidence = QStandardItem()
+            confidence.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.file_list_model.appendRow([item, QStandardItem(), confidence])
 
-            file_str = str(file_path)
-            cache_hit = False
-            if self.cache_manager:
+            if key not in self.file_hashes:
                 try:
-                    file_hash = self.cache_manager.compute_hash(file_path)
-                    self.file_hashes[file_str] = file_hash
-                    cached = self.cache_manager.get_cached_result(file_hash)
-                    if cached:
-                        _images, suggestion, gui_state = cached
-                        if gui_state:
-                            suggestion = FilingSuggestion(
-                                filename=gui_state["filename"],
-                                destination=gui_state["destination"],
-                                confidence=suggestion.confidence,
-                                reasoning=suggestion.reasoning,
-                            )
-                        self.suggestions[file_str] = suggestion
-                        item.setText(f"✓ {file_path.name}")
-                        cache_hit = True
-                except Exception as e:
-                    logger.warning("Cache lookup failed for %s: %s", file_path.name, e)
+                    self.file_hashes[key] = self.cache_manager.compute_hash(path)
+                except OSError as e:
+                    logger.warning("Could not hash %s: %s", path.name, e)
+            if key not in self.suggestions and (h := self.file_hashes.get(key)):
+                if cached := self.cache_manager.get_cached_result(h):
+                    self.suggestions[key] = cached
+            self._update_item_status(key)
 
-            if not cache_hit:
-                self.suggestions[file_str] = FilingSuggestion(
-                    filename=file_path.name,
-                    destination="",
-                    confidence=1.0,
-                    reasoning="Current state"
-                )
-
+        logger.info(f"Found {len(self.files)} files")
         if self.files:
-            # Select first item
-            first_index = self.file_list_model.index(0, 0)
-            self.file_list.setCurrentIndex(first_index)
-
-    def _on_file_selected(self, current, previous):
-        """Handle file selection in the list.
-
-        Args:
-            current: Current QModelIndex
-            previous: Previous QModelIndex
-        """
-        if not current.isValid():
-            return
-
-        row = current.row()
-        if row < 0 or row >= len(self.files):
-            return
-
-        self.current_file_index = row
-        file_path = self.files[row]
-
-        # Update viewer
-        self.file_viewer.set_file(file_path)
-
-        # If we have a suggestion for this file, display it
-        if str(file_path) in self.suggestions:
-            suggestion = self.suggestions[str(file_path)]
-            if isinstance(suggestion, FilingSuggestion):
-                self.file_viewer.set_suggestion(
-                    suggestion.filename,
-                    suggestion.destination,
-                    suggestion.confidence,
-                    suggestion.reasoning,
-                )
-            else:
-                # It might be an Exception or None
-                self.file_viewer.clear_suggestion()
+            row = self.current_file_index if 0 <= self.current_file_index < len(self.files) else 0
+            self.file_list.setCurrentIndex(self.file_list_model.index(row, 0))
         else:
-            # No suggestion at all for this file
+            self.current_file_index = -1
             self.file_viewer.clear_suggestion()
 
-    def _on_viewer_filename_changed(self, text):
-        """Handle manual filename changes in the viewer."""
-        if self.current_file_index >= 0:
-            file_path = str(self.files[self.current_file_index])
-            suggestion = self.suggestions.get(file_path)
-            if isinstance(suggestion, FilingSuggestion):
-                suggestion.filename = text
-            else:
-                self.suggestions[file_path] = FilingSuggestion(
-                    filename=text,
-                    destination="",
-                    confidence=1.0,
-                    reasoning="Manual override"
-                )
-            self._save_gui_state_to_cache(file_path)
+    def _row_for_path(self, key: str) -> int | None:
+        for row in range(self.file_list_model.rowCount()):
+            if self.file_list_model.item(row, COL_FILE).data(PATH_ROLE) == key:
+                return row
+        return None
 
-    def _on_viewer_destination_changed(self, text):
-        """Handle manual destination changes in the viewer."""
-        if self.current_file_index >= 0:
-            file_path = str(self.files[self.current_file_index])
-            suggestion = self.suggestions.get(file_path)
-            if isinstance(suggestion, FilingSuggestion):
-                suggestion.destination = text
-            else:
-                self.suggestions[file_path] = FilingSuggestion(
-                    filename=Path(file_path).name,
-                    destination=text,
-                    confidence=1.0,
-                    reasoning="Manual override"
-                )
-            self._save_gui_state_to_cache(file_path)
-
-    def _save_gui_state_to_cache(self, file_path_str: str) -> None:
-        """Persist current filename/destination edits to the cache entry."""
-        if not self.cache_manager:
+    def _update_item_status(self, key: str):
+        """Refresh a row: ✓/❌ marker, suggested new name, and confidence."""
+        row = self._row_for_path(key)
+        if row is None:
             return
-        suggestion = self.suggestions.get(file_path_str)
+        result = self.suggestions.get(key)
+        model = self.file_list_model
+        marker = "✓ " if isinstance(result, FilingSuggestion) else "❌ " if isinstance(result, Exception) else ""
+        model.item(row, COL_FILE).setText(marker + Path(key).name)
+        new_name = model.item(row, COL_NEW_NAME)
+        confidence = model.item(row, COL_CONFIDENCE)
+        if isinstance(result, FilingSuggestion):
+            new_name.setText(display_name(result))
+            new_name.setToolTip(display_name(result))
+            confidence.setText(f"{result.confidence:.0%}")
+        else:
+            error = self._error_message(result) if isinstance(result, Exception) else ""
+            new_name.setText(error)
+            new_name.setToolTip(error)
+            confidence.setText("")
+
+    def _checked_paths(self) -> list[str]:
+        return [
+            item.data(PATH_ROLE)
+            for row in range(self.file_list_model.rowCount())
+            if (item := self.file_list_model.item(row, COL_FILE)).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.file_list_model.rowCount()):
+            self.file_list_model.item(row, COL_FILE).setCheckState(state)
+
+    def _on_file_selected(self, current, _previous):
+        if not current.isValid() or current.row() >= len(self.files):
+            return
+        self.current_file_index = current.row()
+        path = self.files[current.row()]
+        self.file_viewer.set_file(path)
+        self._show_result(str(path))
+
+    def _show_result(self, key: str):
+        result = self.suggestions.get(key)
+        if isinstance(result, FilingSuggestion):
+            self.file_viewer.set_suggestion(result.filename, result.destination, result.confidence, result.reasoning)
+        elif isinstance(result, Exception):
+            self.file_viewer.clear_suggestion(f"Analysis failed: {self._error_message(result)}")
+        else:
+            self.file_viewer.clear_suggestion("Not processed yet")
+
+    def _current_key(self) -> str | None:
+        if 0 <= self.current_file_index < len(self.files):
+            return str(self.files[self.current_file_index])
+        return None
+
+    def _on_viewer_edited(self, filename: str | None = None, destination: str | None = None):
+        """Apply a manual edit to the current file's suggestion and persist it."""
+        key = self._current_key()
+        if key is None:
+            return
+        suggestion = self.suggestions.get(key)
         if not isinstance(suggestion, FilingSuggestion):
-            return
-        file_hash = self.file_hashes.get(file_path_str)
-        if not file_hash:
-            return
-        try:
+            suggestion = FilingSuggestion(
+                filename=self.file_viewer.get_filename() or Path(key).name,
+                destination=self.file_viewer.get_destination(),
+                confidence=1.0,
+                reasoning="Manual entry",
+            )
+            self.suggestions[key] = suggestion
+        if filename is not None:
+            suggestion.filename = filename
+        if destination is not None:
+            suggestion.destination = destination
+        self._update_item_status(key)
+        if file_hash := self.file_hashes.get(key):
             self.cache_manager.save_gui_state(file_hash, suggestion.filename, suggestion.destination)
-        except Exception as e:
-            logger.warning("Failed to save gui_state: %s", e)
+
+    def _error_message(self, exc: Exception) -> str:
+        return classify_api_error(self.config.vlm_provider, exc)
+
+    # --- analysis ------------------------------------------------------------------
 
     def _process_selected(self):
-        """Process only the checked files in the list."""
-        checked_files = []
-        for i in range(self.file_list_model.rowCount()):
-            item = self.file_list_model.item(i)
-            if item and item.checkState() == Qt.CheckState.Checked:
-                file_path = item.data(Qt.ItemDataRole.UserRole)
-                if file_path:
-                    checked_files.append(Path(file_path))
-
-        if not checked_files:
+        checked = self._checked_paths()
+        if not checked:
             QMessageBox.warning(self, "No Selection", "Please check at least one file to process.")
             return
 
-        # Skip files that already have a valid cache entry
-        if self.cache_manager:
-            uncached = [
-                fp for fp in checked_files
-                if not self.cache_manager.has_entry(self.file_hashes.get(str(fp), ""))
-            ]
-            skipped = len(checked_files) - len(uncached)
-            if skipped:
-                logger.info("Skipping %d cached file(s), processing %d", skipped, len(uncached))
-            if not uncached:
-                QMessageBox.information(
-                    self, "All Cached",
-                    f"All {skipped} selected file(s) already have results.\n"
-                    "Delete cache/ to force reprocessing."
-                )
-                return
-            checked_files = uncached
+        to_process = [Path(k) for k in checked if not self.cache_manager.has_entry(self.file_hashes.get(k))]
+        skipped = len(checked) - len(to_process)
+        if skipped:
+            logger.info("Skipping %d cached file(s), processing %d", skipped, len(to_process))
+        if not to_process:
+            QMessageBox.information(
+                self, "All Cached",
+                f"All {skipped} selected file(s) already have results.\nDelete cache/ to force reprocessing.",
+            )
+            return
 
-        # Disable only action buttons during processing
-        # The user can still browse and select files
-        self.process_button.setEnabled(False)
-        self.context_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(checked_files))
+        self._set_busy(True)
+        self.progress_bar.setRange(0, len(to_process))
         self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._batch_done = self._batch_errors = 0
 
-        # Start processing thread
-        self.processing_thread = ProcessingThread(
-            checked_files, self.vlm_service, max_parallel=self.config.vlm_max_parallel
-        )
-        self.processing_thread.progress.connect(self._on_progress)
+        self.processing_thread = ProcessingThread(to_process, self.vlm_service, self.config.vlm_max_parallel)
         self.processing_thread.file_processed.connect(self._on_file_processed)
         self.processing_thread.finished.connect(self._on_processing_finished)
         self.processing_thread.start()
 
-    def _on_progress(self, current: int, total: int):
-        """Handle progress update.
-
-        Args:
-            current: Current file number.
-            total: Total number of files.
-        """
-        self.progress_bar.setValue(current)
-        logger.info(f"Progress: {current}/{total}")
-
-    def _on_file_processed(self, file_path: str, result):
-        """Handle a file being processed.
-
-        Args:
-            file_path: Path to the processed file.
-            result: FilingSuggestion or Exception.
-        """
+    def _on_file_processed(self, key: str, result):
+        self._batch_done += 1
+        self.progress_bar.setValue(self._batch_done)
         if isinstance(result, Exception):
-            provider = self.config.vlm_provider if self.config else "unknown"
-            msg = classify_api_error(provider, result)
-            logger.error(f"Error processing {file_path}: {msg}")
-            self.suggestions[file_path] = result  # Store exception to signal failure
-            # Mark as error in the list
-            for i in range(self.file_list_model.rowCount()):
-                item = self.file_list_model.item(i)
-                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
-                    item.setText(f"❌ {Path(file_path).name}")
-                    break
-        else:
-            # Store suggestion
-            self.suggestions[file_path] = result
-
-            # Update list item
-            for i in range(self.file_list_model.rowCount()):
-                item = self.file_list_model.item(i)
-                if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
-                    item.setText(f"✓ {Path(file_path).name}")
-                    break
-
-            # If this is the currently selected file, update viewer
-            if self.current_file_index >= 0:
-                current_path = str(self.files[self.current_file_index])
-                if current_path == file_path:
-                    self.file_viewer.set_suggestion(
-                        result.filename,
-                        result.destination,
-                        result.confidence,
-                        result.reasoning,
-                    )
+            self._batch_errors += 1
+            logger.error(f"Error processing {key}: {self._error_message(result)}")
+        self.suggestions[key] = result
+        self._update_item_status(key)
+        if key == self._current_key():
+            self._show_result(key)
 
     def _on_processing_finished(self):
-        """Handle processing completion."""
         self.progress_bar.setVisible(False)
-        self.process_button.setEnabled(True)
-        self.context_button.setEnabled(True)
-
-        # Log summary instead of a popup
-        success_count = sum(1 for s in self.suggestions.values() if isinstance(s, FilingSuggestion))
-        error_count = sum(1 for s in self.suggestions.values() if isinstance(s, Exception))
-
-        logger.info(f"Processing Complete: {success_count} successful, {error_count} failed")
-
-    def _select_all_files(self):
-        """Select all files in the list."""
-        for i in range(self.file_list_model.rowCount()):
-            item = self.file_list_model.item(i)
-            if item:
-                item.setCheckState(Qt.CheckState.Checked)
-        logger.debug("Selected all files")
-
-    def _select_no_files(self):
-        """Deselect all files in the list."""
-        for i in range(self.file_list_model.rowCount()):
-            item = self.file_list_model.item(i)
-            if item:
-                item.setCheckState(Qt.CheckState.Unchecked)
-        logger.debug("Deselected all files")
-
-    def _get_selected_files(self):
-        """Get list of selected file paths with suggestions.
-
-        Returns:
-            List of tuples: (file_path_str, suggestion)
-        """
-        selected = []
-        for i in range(self.file_list_model.rowCount()):
-            item = self.file_list_model.item(i)
-            if item and item.checkState() == Qt.CheckState.Checked:
-                file_path_str = item.data(Qt.ItemDataRole.UserRole)
-                if file_path_str in self.suggestions:
-                    suggestion = self.suggestions[file_path_str]
-                    if isinstance(suggestion, FilingSuggestion):
-                        selected.append((file_path_str, suggestion))
-        return selected
-
-    def _execute_rename(self):
-        """Rename selected files in place (same directory)."""
-        selected = self._get_selected_files()
-
-        if not selected:
+        self._set_busy(False)
+        ok = self._batch_done - self._batch_errors
+        logger.info(f"Processing complete: {ok} successful, {self._batch_errors} failed")
+        if self._batch_errors:
             QMessageBox.warning(
-                self,
-                "No Files Selected",
-                "Please select files and process them first.",
+                self, "Processing Finished With Errors",
+                f"{ok} file(s) succeeded, {self._batch_errors} failed (marked ❌). See the log for details.",
             )
+
+    # --- rename / move ---------------------------------------------------------------
+
+    def _target_path(self, source: Path, suggestion: FilingSuggestion, move: bool) -> Path | None:
+        """Where a file should go, or None if there is nothing to do."""
+        if not suggestion.filename or Path(suggestion.filename).name != suggestion.filename:
+            raise ValueError(f"invalid filename {suggestion.filename!r}")
+        if not move:
+            return source.parent / suggestion.filename
+        if not suggestion.destination:
+            return None  # skipped: no destination
+        base = Path(self.config.dest_base) if self.config.dest_base else source.parent
+        return base / Path(suggestion.destination).expanduser() / suggestion.filename
+
+    def _execute(self, move: bool):
+        """Rename (move=False) or rename-and-move (move=True) checked files."""
+        selected = [(k, s) for k in self._checked_paths() if isinstance(s := self.suggestions.get(k), FilingSuggestion)]
+        if not selected:
+            QMessageBox.warning(self, "No Files Selected", "Please select files and process them first.")
             return
 
-        # Confirm with user
+        action = "rename and move" if move else "rename"
+        where = "to their suggested destinations" if move else "in their current location"
         reply = QMessageBox.question(
-            self,
-            "Confirm Rename",
-            f"This will rename {len(selected)} file(s) in their current location.\n"
-            "This operation cannot be undone.\n\n"
-            "Are you sure you want to continue?",
+            self, f"Confirm {action.title()}",
+            f"This will {action} {len(selected)} file(s) {where}.\n"
+            "This operation cannot be undone.\n\nAre you sure you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Execute rename operations
-        success_count = 0
-        error_count = 0
-
-        # Prepare state migration for successful renames
-        migrated_suggestions = {}
-
-        for file_path_str, suggestion in selected:
-            file_path = Path(file_path_str)
-            new_path = file_path.parent / suggestion.filename
-
+        done, skipped, errors = 0, 0, []
+        for key, suggestion in selected:
+            source = Path(key)
             try:
-                if new_path.exists() and new_path != file_path:
-                    logger.warning(f"Target file already exists: {new_path}")
-                    error_count += 1
+                target = self._target_path(source, suggestion, move)
+                if target is None or target == source:
+                    logger.debug(f"Skipping {source}: nothing to {action}")
+                    skipped += 1
                     continue
-
-                file_path.rename(new_path)
-                logger.info(f"Renamed {file_path_str} -> {new_path}")
-
-                # Keep the suggestion but update it for the new path
-                # Also mark as successfully renamed for state migration
-                migrated_suggestions[str(new_path)] = suggestion
-                success_count += 1
-
+                if target.exists():
+                    if target.is_file() and filecmp.cmp(source, target, shallow=False):
+                        raise FileExistsError(f"identical file already exists: {target}")
+                    unique = unique_path(target)
+                    logger.warning(f"{target} already exists; using {unique.name}")
+                    target = unique
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(source, target)  # works across filesystems, unlike Path.rename
             except Exception as e:
-                logger.error(f"Failed to rename {file_path}: {e}", exc_info=True)
-                error_count += 1
-
-        # Log result
-        logger.info(f"Rename Complete: Successfully renamed: {success_count} file(s), Errors: {error_count} file(s)")
-
-        # Update and reload folder without losing state
-        if success_count > 0:
-            # We don't clear suggestions entirely. We migrate the renamed ones.
-            # Any non-renamed files will keep their suggestions.
-            for old_path, suggestion in selected:
-                if str(Path(old_path).parent / suggestion.filename) in migrated_suggestions:
-                    self.suggestions.pop(old_path, None)
-
-            # Merge migrated suggestions back
-            self.suggestions.update(migrated_suggestions)
-
-            # Force a re-scan of the folder to update self.files and the list model
-            # but preserve our current self.suggestions
-            current_folder = self.files[0].parent if self.files else None
-            if current_folder:
-                self._refresh_folder_preserving_state(str(current_folder))
-
-    def _execute_move(self):
-        """Move selected files to their suggested destinations."""
-        selected = self._get_selected_files()
-
-        if not selected:
-            QMessageBox.warning(
-                self,
-                "No Files Selected",
-                "Please select files and process them first.",
-            )
-            return
-
-        # Confirm with user
-        reply = QMessageBox.question(
-            self,
-            "Confirm Rename and Move",
-            f"This will rename and move {len(selected)} file(s) to their suggested destinations.\n"
-            "This operation cannot be undone.\n\n"
-            "Are you sure you want to continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # Execute move operations
-        success_count = 0
-        error_count = 0
-
-        for file_path_str, suggestion in selected:
-            # Skip if destination is empty
-            if not suggestion.destination:
-                logger.info(f"Skipping {file_path_str} (no destination)")
+                logger.error(f"Failed to {action} {source}: {e}", exc_info=not isinstance(e, (OSError, ValueError)))
+                errors.append(f"{source.name}: {e}")
                 continue
 
-            file_path = Path(file_path_str)
-            # Prioritize source_dir as the base for moving organized files
-            base_dir = self.config.source_dir or self.config.default_dest_base or file_path.parent
+            logger.info(f"{'Moved' if move else 'Renamed'} {source} -> {target}")
+            done += 1
+            # Carry state over to the new path (moved files simply leave the list)
+            self.suggestions[str(target)] = self.suggestions.pop(key)
+            if key in self.file_hashes:
+                self.file_hashes[str(target)] = self.file_hashes.pop(key)
 
-            # Construct destination path
-            dest_dir = Path(base_dir) / suggestion.destination
-            dest_path = dest_dir / suggestion.filename
+        logger.info(f"{action.title()} complete: {done} done, {skipped} skipped, {len(errors)} failed")
+        if errors:
+            QMessageBox.warning(self, f"{action.title()} Errors", "\n".join(errors[:20]))
+        if done and self.current_folder:
+            self._load_folder(self.current_folder)
 
-            try:
-                # Create destination directory if needed
-                dest_dir.mkdir(parents=True, exist_ok=True)
-
-                if dest_path.exists() and dest_path != file_path:
-                    logger.warning(f"Target file already exists: {dest_path}")
-                    error_count += 1
-                    continue
-
-                # Move/rename file
-                file_path.rename(dest_path)
-                logger.info(f"Moved {file_path} -> {dest_path}")
-                success_count += 1
-
-            except Exception as e:
-                logger.error(f"Failed to move {file_path}: {e}", exc_info=True)
-                error_count += 1
-
-        # Log result
-        logger.info(f"Move Complete: Successfully moved: {success_count} file(s), Errors: {error_count} file(s)")
-
-        # Reload folder
-        if success_count > 0:
-            current_folder = self.files[0].parent if self.files else None
-            if current_folder:
-                self._load_folder(str(current_folder))
-
-    def _refresh_folder_preserving_state(self, folder_path: str):
-        """Reload folder contents without clearing existing suggestions.
-
-        Args:
-            folder_path: Path to the folder.
-        """
-        folder = Path(folder_path)
-        logger.debug(f"Refreshing folder: {folder}")
-
-        # Find all supported files
-        patterns = ["*.pdf", "*.png", "*.jpg", "*.jpeg", "*.tiff", "*.tif", "*.bmp"]
-        self.files = []
-
-        for pattern in patterns:
-            self.files.extend(folder.glob(pattern))
-
-        # Update file list model but keep self.suggestions!
-        self.file_list_model.clear()
-
-        for file_path in self.files:
-            file_str = str(file_path)
-            item = QStandardItem(file_path.name)
-            item.setCheckable(True)
-            item.setCheckState(Qt.CheckState.Checked)
-            item.setData(file_str, Qt.ItemDataRole.UserRole)
-
-            # Mark processed/state
-            if file_str in self.suggestions:
-                res = self.suggestions[file_str]
-                if isinstance(res, FilingSuggestion):
-                    item.setText(f"✓ {file_path.name}")
-                elif isinstance(res, Exception):
-                    item.setText(f"❌ {file_path.name}")
-            else:
-                # New file or one we lost state for
-                self.suggestions[file_str] = FilingSuggestion(
-                    filename=file_path.name,
-                    destination="",
-                    confidence=1.0,
-                    reasoning="Refreshed"
-                )
-
-            self.file_list_model.appendRow(item)
-
-        if self.files:
-            # Re-select the same index if valid, else first
-            new_index = self.current_file_index if 0 <= self.current_file_index < len(self.files) else 0
-            first_index = self.file_list_model.index(new_index, 0)
-            self.file_list.setCurrentIndex(first_index)
+    # --- context generation ---------------------------------------------------------
 
     def _generate_context(self):
-        """Generate filing context from the organized documents directory."""
-        if not self.config or not self.config.source_dir:
+        if not self.config.source_dir:
             QMessageBox.warning(
-                self,
-                "Configuration Missing",
-                "SOURCE_DIR is not set in your .env file. Please set it to your organized documents root."
+                self, "Configuration Missing",
+                "SOURCE_DIR is not set in your .env file. Please set it to your organized documents root.",
             )
             return
-
         source_path = Path(self.config.source_dir)
-        if not source_path.exists():
-            QMessageBox.critical(
-                self,
-                "Directory Not Found",
-                f"SOURCE_DIR does not exist: {source_path}"
-            )
+        if not source_path.is_dir():
+            QMessageBox.critical(self, "Directory Not Found", f"SOURCE_DIR does not exist: {source_path}")
             return
 
-        # Confirm with user
         reply = QMessageBox.question(
-            self,
-            "Confirm Context Generation",
-            f"This will scan {source_path} and use an LLM to update your filing conventions.\n\n"
-            "This may take a minute and will consume API tokens.\n\n"
-            "Do you want to continue?",
+            self, "Confirm Context Generation",
+            f"This will scan {source_path} and use {self.config.vlm_provider} to update your "
+            "filing conventions.\n\nThis may take a minute.\n\nDo you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Disable UI
-        self.setEnabled(False)
+        self._set_busy(True)
+        self.progress_bar.setRange(0, 0)  # indeterminate
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate progress
-
-        # Start thread
-        self.context_thread = ContextGenerationThread(source_path)
-        self.context_thread.finished.connect(self._on_context_generated)
+        self.context_thread = ContextGenerationThread(source_path, self.config)
+        self.context_thread.result.connect(self._on_context_generated)
         self.context_thread.start()
 
     def _on_context_generated(self, result):
-        """Handle completion of context generation."""
-        self.setEnabled(True)
         self.progress_bar.setVisible(False)
-
+        self._set_busy(False)
         if isinstance(result, Exception):
-            provider = self.config.vlm_provider if self.config else "unknown"
-            msg = classify_api_error(provider, result)
-            QMessageBox.critical(self, "Context Generation Failed", msg)
-        else:
-            QMessageBox.information(
-                self,
-                "Context Updated",
-                "Filing context has been successfully updated and saved to src/data/context.md.\n\n"
-                "The new conventions will be used for future document analysis."
-            )
+            QMessageBox.critical(self, "Context Generation Failed", self._error_message(result))
+            return
+        try:
+            self.vlm_service = create_vlm_service(self.config, cache_manager=self.cache_manager)
+            logger.info("VLM service refreshed with new context")
+        except Exception as e:
+            logger.error(f"Failed to refresh VLM service: {e}")
+        QMessageBox.information(
+            self, "Context Updated",
+            "Filing context has been updated and saved to src/data/context.md.\n\n"
+            "The new conventions will be used for future document analysis.",
+        )
 
-            # Refresh VLM service with new context
-            try:
-                self.vlm_service = create_vlm_service(self.config, cache_manager=self.cache_manager)
-                logger.info("VLM service refreshed with new context")
-            except Exception as e:
-                logger.error(f"Failed to refresh VLM service: {e}")
+    def closeEvent(self, event):
+        """Wait for background threads so Qt does not abort on exit."""
+        for thread in (self.processing_thread, self.context_thread):
+            if thread and thread.isRunning():
+                logger.info("Waiting for background work to finish...")
+                thread.wait()
+        super().closeEvent(event)
 
+
+_QT_LOG_LEVELS = {
+    QtMsgType.QtDebugMsg: logging.DEBUG,
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+
+
+def _qt_message_handler(msg_type: QtMsgType, _context: QMessageLogContext, message: str) -> None:
+    """Send Qt's own diagnostics through Python logging."""
+    logging.getLogger("qt").log(_QT_LOG_LEVELS.get(msg_type, logging.INFO), message)
 
 
 def main():
     """Main entry point for the GUI application."""
+    # X410 / WSL2: force X11 when a display exists, otherwise render offscreen
+    if not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb" if os.environ.get("DISPLAY") else "offscreen"
 
-    # Configure Qt platform for different environments
-    if not os.environ.get('QT_QPA_PLATFORM'):
-        if os.environ.get('DISPLAY'):
-            # X server is available (e.g., X410) - use xcb (X11) explicitly
-            # This prevents Qt from trying Wayland first, which X410 doesn't support
-            os.environ['QT_QPA_PLATFORM'] = 'xcb'
-        else:
-            # No display server - use offscreen rendering
-            os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-
-    # Configure logging to both file and console
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-
-    log_filename = os.path.join(
-        log_dir,
-        f"docfiler_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-
-    # Create formatters and handlers
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # File handler
-    file_handler = logging.FileHandler(log_filename)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-
-    logger.info(f"Logging to file: {log_filename}")
+    log_file = setup_logging("docfiler_gui")
+    qInstallMessageHandler(_qt_message_handler)
+    logger.info(f"Logging to file: {log_file}")
     logger.info("Starting Document Filer GUI")
 
-    # Create application
     app = QApplication(sys.argv)
-
-    # Create and show main window
     window = MainWindow()
     window.show()
 
-    # Set up signal handler for graceful shutdown on Ctrl-C
-    def signal_handler(signum, frame):
-        """Handle Ctrl-C gracefully."""
-        logger.info("Received interrupt signal, shutting down gracefully...")
-        app.quit()
+    # Ctrl-C: Python signal handlers only run when the interpreter gets control,
+    # so a no-op Python timer callback wakes it up periodically.
+    signal.signal(signal.SIGINT, lambda *_: (logger.info("Interrupted, shutting down..."), app.quit()))
+    timer = QTimer()
+    timer.timeout.connect(lambda: None)
+    timer.start(500)
 
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # Allow Ctrl-C to work by setting up a timer to process events
-    # This is needed because Qt event loop blocks signal handling
-    app.startTimer(500)  # Check for signals every 500ms
-
-    # Run application
-    try:
-        exit_code = app.exec()
-        logger.info("Application exited normally")
-        sys.exit(exit_code)
-    except KeyboardInterrupt:
-        logger.info("Application interrupted by user")
-        sys.exit(0)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

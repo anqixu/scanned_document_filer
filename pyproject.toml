@@ -21,14 +21,12 @@ classifiers = [
 ]
 dependencies = [
     "PyQt6>=6.6.0",
-    "PyQt6-Qt6>=6.6.0",
     "pillow>=10.0.0",
-    "pypdf>=3.17.0",
+    "pypdf>=4.0.0",
     "python-dotenv>=1.0.0",
     "anthropic>=0.18.0",
-    "openai>=1.12.0",
+    "openai>=1.45.0",
     "google-genai>=0.1.0",
-    "requests>=2.31.0",
     "pdf2image>=1.16.0",
     "simple-parsing>=0.1.0",
     "tqdm>=4.66.0",
@@ -41,9 +39,6 @@ dev = [
     "pytest-qt>=4.2.0",
     "ruff>=0.1.0",
 ]
-pdf-preview = [
-    "pdf2image>=1.16.0",
-]
 
 [project.scripts]
 docfiler-gui = "docfiler.gui.main_window:main"
@@ -52,9 +47,6 @@ docfiler-context = "docfiler.cli.context_generator:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["docfiler*"]
-
-[tool.setuptools.package-data]
-docfiler = ["data/*.md"]
 
 [tool.ruff]
 line-length = 100
@@ -84,6 +76,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=docfiler --cov-report=term-missing"
+qt_api = "pyqt6"
 
 [tool.coverage.run]
 source = ["docfiler"]

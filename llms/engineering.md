@@ -6,7 +6,8 @@
 
 ### Imports & Dependencies
 - **No Lazy Imports**: All imports must be declared at the top of the file to ensure dependency clarity and fail-fast startup.
-- **Explicit Constants**: Prefer explicit constants in `config.py` over hardcoded strings.
+- **Explicit Constants**: Prefer explicit constants in `config.py` over hardcoded strings. Project paths (`DATA_DIR`, `LOGS_DIR`, `LOG_FILE_DIR`, `CACHE_DIR`) and logging setup live there too.
+- **Single Provider Seam**: Each `VLMClient` implements only `generate(prompt, images, max_tokens) -> str`; JSON parsing, smoke tests and text-only calls build on it.
 
 ### Three-Layer Architecture
 1.  **Orchestration (Top)**: Entry points like `main_window.py` and `context_generator.py`. They should read like a high-level table of contents.
@@ -15,8 +16,11 @@
 
 ## Logging & Auditing
 
-### Unified Directory
-- All logs and audit files must reside in the project-root `logs/` directory.
+### Logging
+- All diagnostics go through the `logging` library (no `print`). `setup_logging()` writes everything, including DEBUG, to `<system temp dir>/<prefix>_<timestamp>.log`, and also routes Python warnings, uncaught exceptions and Qt messages through `logging`.
+
+### Audit Directory
+- Prompt/response audit files reside in the project-root `logs/` directory.
 - This directory is git-ignored to prevent leaking sensitive document metadata.
 
 ### Prompt Caching
@@ -35,7 +39,7 @@
 
 ## Testing Standards
 
-- **Isolation**: Unit tests must not require active API keys or network access (use mocks).
+- **Isolation**: Unit tests must not require active API keys, network access, or real CLIs (use mocks). `src/tests/conftest.py` redirects `DATA_DIR`/`LOGS_DIR`/`LOG_FILE_DIR` to a temp dir; `load_config` tests must not read the real `.env`.
 - **Environment**: Use `pytest-qt` for GUI testing and `pytest-cov` for coverage monitoring.
 - **Locations**: Tests are mirroring the `src/docfiler/` structure inside `src/tests/`.
 
@@ -58,7 +62,8 @@
 
 ## Configuration
 
-- **Environment-First**: All secrets and local path configurations (like `SOURCE_DIR`, `VLM_MAX_TOKENS`, and `SCAN_IGNORE_PATTERNS`) go in `.env`.
+- **Environment-First**: All secrets and local path configurations (like `SOURCE_DIR`, `INPUT_DIR`, `VLM_MAX_TOKENS`, and `SCAN_IGNORE_PATTERNS`) go in `.env`.
+- **No Accidental Billing**: CLI providers must strip API-key env vars from the subprocess environment so the CLI's subscription login is used.
 - **Template Sync**: Ensure `.env.template` is updated whenever a new config key is added.
 - **Fail Fast**: The application must validate required API keys and paths at startup.
 

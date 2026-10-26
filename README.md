@@ -5,11 +5,11 @@ AI-powered document organization tool that uses Vision Language Models (VLMs) to
 ## Features
 
 - 🧠 **Smart Context**: Learns your filing patterns by analyzing your existing folder structure.
-- 🎯 **VLM Analysis**: Supports Claude, GPT-4, and Gemini for high-accuracy document understanding.
+- 🎯 **VLM Analysis**: Use your Claude or ChatGPT subscription through the Claude Code / Codex CLIs, or the Claude, OpenAI and Gemini APIs. Switch providers from a dropdown in the GUI.
 - 🖼️ **Robust Preview**: High-fidelity PDF rendering (`pdf2image`) and large image support.
 - 🖱️ **Interactive Batch GUI**: Multi-file processing with manual overrides and progress tracking.
 - 🔄 **Rename vs. Move**: Flexible execution—rename files in-place or move them into organized hierarchies.
-- 📋 **Audit Trail**: Detailed project-local logs and per-request prompt/response caching in `logs/`.
+- 📋 **Audit Trail**: Full DEBUG log in the system temp dir (e.g. `/tmp/docfiler_gui_<timestamp>.log`) and per-request prompt/response caching in `logs/`.
 
 ## Installation
 
@@ -64,7 +64,16 @@ brew install poppler
    # Depending on your terminal in Windows, you may need to use:
    # copy .env.template .env
    ```
-*Configure your API keys and `SOURCE_DIR` in `.env`.*
+*Configure `SOURCE_DIR` (and API keys, if you use an API provider) in `.env`.*
+
+### Using a subscription instead of an API key
+
+The default provider, `claude-cli`, runs [Claude Code](https://claude.com/claude-code) non-interactively (`claude -p`) and uses whatever account the CLI is logged into, such as a Claude Pro/Max subscription. `codex-cli` does the same with the Codex CLI (`codex exec`) and a ChatGPT plan.
+
+1. Install the CLI and log in once interactively (`claude`, or `codex login`).
+2. Set `VLM_PROVIDER=claude-cli` or `codex-cli`, or pick it in the GUI dropdown.
+
+The app strips `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the CLI's environment, so a key in `.env` won't be billed by accident. Page images are sent with the prompt and CLI tools are disabled (Claude) or sandboxed read-only (Codex).
 
 ### WSL2 with X410 (Windows)
 
@@ -110,26 +119,33 @@ The application auto-detects `DISPLAY` and sets `QT_QPA_PLATFORM=xcb` accordingl
 ```bash
 docfiler-gui
 ```
-1. **Load**: Auto-loads from your configured source directory.
+1. **Load**: Auto-loads your inbox (`INPUT_DIR`), or use **Open Folder...**. Pick a provider from the dropdown.
 2. **Scan**: Click **"Generate Filing Context"** to sync AI conventions with your existing documents.
 3. **Analyze**: Click **"Process Selected Files"** to get naming and destination suggestions.
-4. **Execute**: Select files and click **"Rename"** or **"Rename and Move"** to apply changes.
+4. **Execute**: Edit suggestions if needed, then click **"Rename"** or **"Rename and Move"**. Files with an empty destination aren't moved. Results and edits are cached by file content in `cache/`, so reopening a folder restores them.
 
 ### Context Generator (CLI)
 Sync your filing patterns manually:
 ```bash
-docfiler-context
+docfiler-context                          # scans SOURCE_DIR, writes src/data/context.md
+docfiler-context --path ~/Docs --provider codex-cli
 ```
-*Defaults to using `SOURCE_DIR` from `.env` and saving to `src/data/context.md`.*
 
 ## Configuration (.env)
 
 | Key | Description |
 |-----|-------------|
-| `VLM_PROVIDER` | `claude`, `openai`, or `gemini` |
-| `SOURCE_DIR` | Root folder where your organized documents are kept. |
-| `DEFAULT_DEST_BASE` | Where suggested documents should be moved to. |
-| `VLM_MAX_TOKENS` | Max tokens for VLM response (default: 1024). |
+| `VLM_PROVIDER` | `claude-cli` (default), `codex-cli`, `claude`, `openai`, or `gemini` |
+| `SOURCE_DIR` | Root folder of your organized documents (scanned for context; base for destinations). |
+| `DEFAULT_DEST_BASE` | Optional: move files under this folder instead of `SOURCE_DIR`. |
+| `INPUT_DIR` | Inbox folder the GUI opens on startup. |
+| `<PROVIDER>_MODEL` | Model per provider, e.g. `CLAUDE_MODEL`, `CLAUDE_CLI_MODEL` (empty = CLI default). |
+| `VLM_MAX_TOKENS` | Max response tokens for API providers (default: 4096). |
+| `VLM_MAX_PARALLEL` | Documents analyzed concurrently (default: 1). |
+| `PDF_PAGES_TO_EXTRACT` | Evenly spaced PDF pages sent per document (default: 3). |
+| `SCAN_IGNORE_PATTERNS` | Comma-separated regexes; folders whose name matches are skipped when scanning. |
+
+See `.env.template` for the full list.
 
 ## Customization
 

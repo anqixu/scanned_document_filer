@@ -41,7 +41,7 @@ env/
 .env
 
 # Testing
-.coverage
+.coverage*
 .pytest_cache/
 htmlcov/
 .tox/
@@ -64,3 +64,6 @@ logs/
 
 # Document analysis cache
 cache/
+
+# Local Claude Code settings
+.claude/settings.local.json

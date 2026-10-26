@@ -6,9 +6,13 @@ showing the three-layer architecture (top/middle/bottom).
 """
 
 import ast
-import sys
+import logging
 from pathlib import Path
 from typing import NamedTuple
+
+from docfiler.config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 class FunctionInfo(NamedTuple):
@@ -37,8 +41,10 @@ class CodeAnalyzer:
     def analyze(self):
         """Analyze all Python files in the codebase."""
         # Find all Python files
-        py_files = list(self.root_dir.rglob("*.py"))
-        py_files = [f for f in py_files if "test" not in str(f) and "__pycache__" not in str(f)]
+        py_files = [
+            f for f in self.root_dir.rglob("*.py")
+            if not {"tests", "__pycache__"} & set(f.relative_to(self.root_dir).parts)
+        ]
 
         for py_file in py_files:
             self._analyze_file(py_file)
@@ -53,7 +59,7 @@ class CodeAnalyzer:
             with open(file_path, encoding="utf-8") as f:
                 tree = ast.parse(f.read(), filename=str(file_path))
         except Exception as e:
-            print(f"Warning: Could not parse {file_path}: {e}", file=sys.stderr)
+            logger.warning(f"Could not parse {file_path}: {e}")
             return
 
         module_name = self._get_module_name(file_path)
@@ -322,40 +328,34 @@ class MermaidGenerator:
 
 def main():
     """Main entry point."""
+    log_file = setup_logging("docfiler_diagrams")
+    logger.info(f"Logging to file: {log_file}")
+
     # Find project root
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
 
     # Analyze codebase
-    print("Analyzing codebase...")
-    analyzer = CodeAnalyzer(project_root / "docfiler")
+    logger.info("Analyzing codebase...")
+    analyzer = CodeAnalyzer(project_root / "src")
     analyzer.analyze()
 
-    print(f"Found {len(analyzer.functions)} functions and {len(analyzer.classes)} classes")
+    logger.info(f"Found {len(analyzer.functions)} functions and {len(analyzer.classes)} classes")
 
     # Generate diagrams
     generator = MermaidGenerator(analyzer)
 
     # Generate layer diagram
-    print("\n" + "=" * 50)
-    print("LAYER ARCHITECTURE DIAGRAM")
-    print("=" * 50)
     layer_diagram = generator.generate_layer_diagram()
-    print(layer_diagram)
+    logger.debug(f"LAYER ARCHITECTURE DIAGRAM:\n{layer_diagram}")
 
     # Generate module diagram
-    print("\n" + "=" * 50)
-    print("MODULE ARCHITECTURE DIAGRAM")
-    print("=" * 50)
     module_diagram = generator.generate_module_diagram()
-    print(module_diagram)
+    logger.debug(f"MODULE ARCHITECTURE DIAGRAM:\n{module_diagram}")
 
     # Generate class diagram
-    print("\n" + "=" * 50)
-    print("CLASS DIAGRAM")
-    print("=" * 50)
     class_diagram = generator.generate_class_diagram()
-    print(class_diagram)
+    logger.debug(f"CLASS DIAGRAM:\n{class_diagram}")
 
     # Save to file
     output_file = project_root / "llms" / "architecture_diagrams.md"
@@ -377,7 +377,7 @@ def main():
         f.write(class_diagram)
         f.write("\n")
 
-    print(f"\n✅ Diagrams saved to {output_file}")
+    logger.info(f"Diagrams saved to {output_file}")
 
 
 if __name__ == "__main__":

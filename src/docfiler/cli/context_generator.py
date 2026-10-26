@@ -1,58 +1,56 @@
 """Context generator for Document Filer.
 
-This script analyzes an existing folder structure to generate a context description
-that helps the VLM understand how to organize documents consistently.
+Scans an existing, organized folder tree and asks the LLM to summarize its
+filing conventions into src/data/context.md, which guides later suggestions.
 """
 
 import logging
 import os
 import re
 import sys
-from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
-from google import genai
-from google.genai import types
-from openai import OpenAI
 from simple_parsing import ArgumentParser, field
 from tqdm import tqdm
 
-from ..api_clients import classify_api_error, create_client
-from ..config import load_config
+from .. import config as cfg
+from ..api_clients import create_client_from_config, smoke_test
+from ..config import PROVIDERS, Config, load_config, setup_logging
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_DEPTH = 8
+DEFAULT_MAX_FILES_PER_DIR = 100
+MAX_FOLDERS = 2000  # cap on folders sent to the LLM
+MAX_FOLDER_INFO_CHARS = 200_000  # ~50k tokens; examples per folder shrink to fit
 
 
 @dataclass
 class ContextGeneratorArgs:
-    """Arguments for the context generator CLI.
+    """Arguments for the context generator CLI."""
 
-    Attributes:
-        path: Path to the folder structure to analyze
-        output: Output file path (default: print to stdout)
-        verbose: Enable verbose logging
-        max_depth: Maximum depth to traverse in folder structure
-        max_files_per_dir: Maximum number of example files to show per directory
-    """
     path: str | None = field(default=None)
-    """Path to the folder structure to analyze (defaults to SOURCE_DIR in config)"""
+    """Folder structure to analyze (defaults to SOURCE_DIR)"""
 
     output: str | None = field(default=None, alias="-o")
     """Output file path (defaults to src/data/context.md)"""
 
+    provider: str | None = field(default=None)
+    """Override VLM_PROVIDER, e.g. claude-cli or codex-cli"""
+
     verbose: bool = False
     """Enable verbose logging"""
 
-    max_depth: int = 8
+    max_depth: int = DEFAULT_MAX_DEPTH
     """Maximum depth to traverse in folder structure"""
 
-    max_files_per_dir: int = 100
+    max_files_per_dir: int = DEFAULT_MAX_FILES_PER_DIR
     """Maximum number of example files to show per directory"""
 
-# Prompt for generating context from folder structure
+
 CONTEXT_GENERATION_PROMPT = """You are analyzing a document filing system's folder structure.
 
 Your task is to generate a concise context description that will help an AI organize new documents
@@ -74,397 +72,186 @@ Respond with ONLY the context description (no JSON, no preamble):
 """
 
 
+def _walk(root_path: Path, max_depth: int, regexes: list[re.Pattern]) -> Iterator[tuple[Path, list[str]]]:
+    """Yield (relative_dir, files) for each directory up to max_depth.
+
+    A directory is skipped (with its subtree) when its name fully matches an
+    ignore pattern, so "CV" skips a folder named CV but not "CVS Receipts".
+    """
+    for root, dirs, files in os.walk(root_path):
+        rel = Path(root).relative_to(root_path)
+        if len(rel.parts) >= max_depth:
+            dirs[:] = []
+        else:
+            dirs[:] = sorted(d for d in dirs if not any(r.fullmatch(d) for r in regexes))
+        yield rel, files
+
+
 def enumerate_folder_structure(
     root_path: Path,
-    max_depth: int = 4,
-    ignore_patterns: list[str] | None = None
-) -> dict:
-    """Enumerate the folder structure and collect information.
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    ignore_patterns: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Map each folder (relative path, "root" for the top) to its file names.
 
-    Args:
-        root_path: Root directory to analyze.
-        max_depth: Maximum depth to traverse.
-        ignore_patterns: List of regex patterns to ignore.
-
-    Returns:
-        Dictionary with folder structure information.
-
-    Note:
-        - 'Items' refers to the total count of filesystem entries (files + directories).
-        - 'Files scanned' specifically refers to regular files encountered during the scan.
+    The first Ctrl+C stops the scan and keeps what was collected so far.
+    A raw listing is also written to src/data/source_scanned_results.txt.
     """
-    structure = defaultdict(list)
+    regexes = [re.compile(p) for p in (ignore_patterns or [])]
+    structure: dict[str, list[str]] = {}
+    raw_results: list[str] = []
+    file_count = 0
 
     logger.info(f"Scanning directory tree: {root_path}")
-
-    # Compile regex patterns
-    regexes = [re.compile(p) for p in (ignore_patterns or [])]
-
-    # Preliminary rough scan to count directories to be visited for the progress bar
-    logger.info("Performing rough directory scan...")
-    total_dirs_to_visit = 0
-    for root, dirs, _files in os.walk(root_path):
-        current_rel = Path(root).relative_to(root_path)
-        depth = len(current_rel.parts)
-
-        # Check if current directory matches any ignore pattern
-        if any(r.search(str(current_rel)) for r in regexes):
-            dirs[:] = []  # Skip this directory and its children
-            continue
-
-        if depth <= max_depth:
-            total_dirs_to_visit += 1
-            if depth == max_depth:
-                dirs[:] = [] # Don't count subdirs if we won't visit them
-
-    # Collect raw paths for secondary output
-    raw_results = []
-
-    # Single pass: enumerate and process with progress updates
-    file_count = 0
-    dir_count = 0
-
-    # Use tqdm with total=total_dirs_to_visit to show percentage
-    with tqdm(total=total_dirs_to_visit, desc="Analyzing structure", unit="dirs", mininterval=0.5) as pbar:
+    # Single pass; no up-front count (that would double the filesystem walk)
+    with tqdm(desc="Analyzing structure", unit="dirs", mininterval=0.5) as pbar:
         try:
-            # We use os.walk for controlled depth and efficient scanning
-            for root, dirs, files in os.walk(root_path):
-                current_path = Path(root)
-                relative_dir = current_path.relative_to(root_path)
-                depth = len(relative_dir.parts)
-
-                # Check if current directory matches any ignore pattern
-                if any(r.search(str(relative_dir)) for r in regexes):
-                    dirs[:] = [] # Skip this directory and its children
-                    continue
-
-                dir_count += 1
+            for rel, files in _walk(root_path, max_depth, regexes):
                 pbar.update(1)
-                raw_results.append(f"DIR: {relative_dir}")
-
-                # If at max depth, stop descending further
-                if depth == max_depth:
-                    dirs[:] = []
-
-                # Use relative path for structure, "root" for top level
-                parent_key = str(relative_dir) if relative_dir != Path(".") else "root"
-
-                # Process files in this directory
-                for f in files:
-                    file_count += 1
-                    structure[parent_key].append(f)
-                    raw_results.append(f"FILE: {relative_dir / f}")
-
-                # Update postfix with file count and the current directory name (truncated if long)
-                dir_label = parent_key if len(parent_key) <= 25 else f"...{parent_key[-22:]}"
-                pbar.set_postfix(files=file_count, dir=dir_label)
+                raw_results.append(f"DIR: {rel}")
+                key = "root" if rel == Path(".") else str(rel)
+                if files:
+                    structure[key] = files
+                    file_count += len(files)
+                    raw_results.extend(f"FILE: {rel / f}" for f in files)
+                label = key if len(key) <= 25 else f"...{key[-22:]}"
+                pbar.set_postfix(files=file_count, dir=label)
         except KeyboardInterrupt:
-            logger.info("\nScan interrupted by user. Proceeding with currently collected data...")
+            logger.info("Scan interrupted by user. Proceeding with data collected so far...")
             logger.info("Press Ctrl+C again to exit immediately.")
 
-    # Save raw results to file
-    results_path = Path(__file__).parent.parent.parent / "data" / "source_scanned_results.txt"
+    results_path = cfg.DATA_DIR / "source_scanned_results.txt"
     try:
         results_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(results_path, "w", encoding="utf-8") as f:
-            f.write(f"# Raw Scan Results (Max Depth: {max_depth})\n")
-            f.write(f"# Root: {root_path}\n")
-            f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
-            f.write("-" * 50 + "\n")
-            f.write("\n".join(raw_results))
+        header = (
+            f"# Raw Scan Results (Max Depth: {max_depth})\n# Root: {root_path}\n"
+            f"# Timestamp: {datetime.now().isoformat()}\n{'-' * 50}\n"
+        )
+        results_path.write_text(header + "\n".join(raw_results), encoding="utf-8")
         logger.info(f"Raw scan results saved to {results_path}")
-    except Exception as e:
+    except OSError as e:
         logger.warning(f"Failed to save raw results: {e}")
 
-    logger.info(f"Found {file_count} files in {dir_count} directories")
-    logger.info(f"Collected {len(structure)} folders within max depth {max_depth}")
-
-    return dict(structure)
+    logger.info(f"Found {file_count} files in {len(structure)} folders (max depth {max_depth})")
+    return structure
 
 
-def format_folder_info(structure: dict, max_files_per_dir: int = 500, max_folders: int = 2000) -> str:
-    """Format folder structure information for the prompt.
+def format_folder_info(
+    structure: dict[str, list[str]],
+    max_files_per_dir: int = DEFAULT_MAX_FILES_PER_DIR,
+    max_folders: int = MAX_FOLDERS,
+    max_chars: int = MAX_FOLDER_INFO_CHARS,
+) -> str:
+    """Format folder structure for the prompt, within a character budget.
 
-    Args:
-        structure: Dictionary of folder -> files.
-        max_files_per_dir: Maximum number of example files to show per directory.
-        max_folders: Maximum number of folders to include to avoid hitting token limits.
-
-    Returns:
-        Formatted string describing the structure.
+    Every folder (up to max_folders) is listed with its file count; the number
+    of example filenames per folder is reduced until the text fits max_chars.
     """
-    lines = []
-    lines.append("Folder Structure:")
-    lines.append("=" * 50)
+    folders = sorted(structure.items())
+    header = ["Folder Structure:", "=" * 50]
+    if len(folders) > max_folders:
+        logger.warning(f"Too many folders ({len(folders)}). Limiting to {max_folders}.")
+        header.append(f"(Showing first {max_folders} folders out of {len(folders)})")
+        folders = folders[:max_folders]
 
-    all_folders = sorted(structure.items())
+    def render(per_dir: int) -> str:
+        lines = list(header)
+        for folder, files in folders:
+            lines += [f"\n{folder}/", f"  ({len(files)} files)"]
+            lines += [f"  - {f}" for f in sorted(files)[:per_dir]]
+            if len(files) > per_dir:
+                lines.append(f"  ... and {len(files) - per_dir} more")
+        return "\n".join(lines)
 
-    if len(all_folders) > max_folders:
-        logger.warning(f"Too many folders ({len(all_folders)}). Limiting to {max_folders} for context generation.")
-        all_folders = all_folders[:max_folders]
-        lines.append(f"(Showing first {max_folders} folders out of {len(structure)})")
-
-    for folder, files in all_folders:
-        lines.append(f"\n{folder}/")
-        lines.append(f"  ({len(files)} files)")
-
-        # Show a few example files
-        examples = files[:max_files_per_dir]
-        for file in examples:
-            lines.append(f"  - {file}")
-
-        if len(files) > max_files_per_dir:
-            lines.append(f"  ... and {len(files) - max_files_per_dir} more")
-
-    return "\n".join(lines)
+    limits = [n for n in (max_files_per_dir, 50, 20, 10, 5, 3, 1, 0) if n <= max_files_per_dir]
+    for per_dir in limits:
+        text = render(per_dir)
+        if len(text) <= max_chars:
+            break
+    if per_dir < max_files_per_dir:
+        logger.info(f"Showing up to {per_dir} example files per folder to fit the prompt budget")
+    return text
 
 
 def generate_context(
     root_path: str | Path,
+    config: Config,
     output_path: str | Path | None = None,
-    max_depth: int = 4,
-    max_files_per_dir: int = 5,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    max_files_per_dir: int = DEFAULT_MAX_FILES_PER_DIR,
 ) -> str:
-    """Generate context by analyzing a folder structure.
+    """Scan root_path, generate filing context with the LLM, and save it.
 
     Args:
         root_path: Root directory to analyze.
-        output_path: Optional path to save the context. If None, prints to stdout.
-        max_depth: Maximum depth to traverse in folder structure.
-        max_files_per_dir: Maximum number of example files to show per directory.
+        config: Application configuration (selects the provider).
+        output_path: Where to save the context (default src/data/context.md).
+        max_depth: Maximum depth to traverse.
+        max_files_per_dir: Maximum example files to show per directory.
 
     Returns:
         Generated context string.
     """
-    root_path = Path(root_path)
+    root_path = Path(root_path).expanduser()
+    if not root_path.is_dir():
+        raise ValueError(f"Directory does not exist: {root_path}")
 
-    if not root_path.exists() or not root_path.is_dir():
-        msg = f"Directory does not exist: {root_path}"
-        raise ValueError(msg)
-
-    logger.info(f"Analyzing folder structure: {root_path}")
-
-    # Load config early to get ignore patterns and other settings
-    config = load_config()
-
-    # Enumerate folder structure
-    structure = enumerate_folder_structure(
-        root_path,
-        max_depth=max_depth,
-        ignore_patterns=config.scan_ignore_patterns
-    )
-
+    client = create_client_from_config(config)  # fail fast before the slow scan
+    structure = enumerate_folder_structure(root_path, max_depth, config.scan_ignore_patterns)
     if not structure:
-        logger.warning(f"No files found in {root_path}")
-        return "Empty folder structure - no context available."
+        raise ValueError(f"No files found in {root_path}")
 
-    # Format for prompt
     folder_info = format_folder_info(structure, max_files_per_dir=max_files_per_dir)
     logger.debug(f"Folder info:\n{folder_info}")
 
-    # Create API client
-    create_client(
-        provider=config.vlm_provider,
-        api_key=config.active_api_key,
-        model=config.active_model,
-    )
-
-    # Generate context using LLM
+    logger.info(f"Sending request to {client.name} to generate context")
     prompt = CONTEXT_GENERATION_PROMPT.format(folder_info=folder_info)
+    context = client.generate(prompt, [], config.vlm_max_tokens * 2).strip()
+    if not context:
+        raise ValueError("LLM returned an empty context")
 
-    logger.info("Sending request to LLM to generate context")
-
-    # For context generation, we don't need images, but our API expects them
-    # So we pass an empty list (each client should handle this gracefully)
-    # Actually, let me modify this to use a text-only API call
-
-    # Since our VLMClient interface requires images, we'll need a different approach
-    # Let's use the provider's native client for text-only requests
-    context = _generate_with_provider(config, prompt)
-
-    logger.info("Context generated successfully")
-
-    # Save or print
-    if not output_path:
-        # Default output path is src/data/context.md
-        # __file__ is src/docfiler/cli/context_generator.py
-        output_path = Path(__file__).parent.parent.parent / "data" / "context.md"
-
-    if output_path:
-        output_path = Path(output_path)
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(context)
-        logger.info(f"Context saved to: {output_path}")
-
+    output_path = Path(output_path) if output_path else cfg.DATA_DIR / "context.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(context, encoding="utf-8")
+    logger.info(f"Context saved to: {output_path}")
     return context
-
-
-def _generate_with_provider(config, prompt: str) -> str:
-    """Generate context using the configured provider.
-
-    Args:
-        config: Application configuration.
-        prompt: The prompt to send.
-
-    Returns:
-        Generated context string.
-    """
-    provider = config.vlm_provider
-
-    if provider == "claude":
-        client = anthropic.Anthropic(api_key=config.active_api_key)
-        response = client.messages.create(
-            model=config.active_model,
-            max_tokens=config.vlm_max_tokens * 2,  # Context generation might need more space
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text
-
-    elif provider == "openai":
-        client = OpenAI(api_key=config.active_api_key)
-
-        # Determine token parameter based on model
-        max_tokens = config.vlm_max_tokens * 2
-        params = {
-            "model": config.active_model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        if config.active_model.startswith(("o1-", "gpt-5")):
-            params["max_completion_tokens"] = max_tokens
-        else:
-            params["max_tokens"] = max_tokens
-
-        response = client.chat.completions.create(**params)
-        return response.choices[0].message.content
-
-    elif provider == "gemini":
-        client = genai.Client(api_key=config.active_api_key)
-        response = client.models.generate_content(
-            model=config.active_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=config.vlm_max_tokens * 2,
-            ),
-        )
-        return response.text
-
-    else:
-        msg = f"Unsupported provider: {provider}"
-        raise ValueError(msg)
-
-
-def smoke_test_provider(config) -> None:
-    """Quick connectivity check for the configured LLM provider.
-
-    Makes a minimal API call to verify the key and network are working
-    before starting the (potentially slow) directory scan.
-
-    Args:
-        config: Application configuration.
-
-    Raises:
-        RuntimeError: If the provider cannot be reached.
-    """
-    provider = config.vlm_provider
-    logger.info(f"Smoke-testing LLM provider: {provider} ({config.active_model})")
-
-    try:
-        if provider == "claude":
-            client = anthropic.Anthropic(api_key=config.active_api_key)
-            client.messages.create(
-                model=config.active_model,
-                max_tokens=5,
-                messages=[{"role": "user", "content": "ping"}],
-            )
-        elif provider == "openai":
-            client = OpenAI(api_key=config.active_api_key)
-            client.chat.completions.create(
-                model=config.active_model,
-                max_tokens=5,
-                messages=[{"role": "user", "content": "ping"}],
-            )
-        elif provider == "gemini":
-            client = genai.Client(api_key=config.active_api_key)
-            client.models.generate_content(
-                model=config.active_model,
-                contents="ping",
-                config=types.GenerateContentConfig(max_output_tokens=5),
-            )
-        logger.info("LLM provider smoke test passed.")
-    except Exception as e:
-        raise RuntimeError(classify_api_error(provider, e)) from e
 
 
 def main():
     """Main entry point for the context generator CLI."""
     parser = ArgumentParser(description="Generate filing context from an existing folder structure")
     parser.add_arguments(ContextGeneratorArgs, dest="args")
-
     args = parser.parse_args().args
 
-    # Configure logging
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_filename = os.path.join(log_dir, f"docfiler_context_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = setup_logging("docfiler_context", logging.DEBUG if args.verbose else logging.INFO)
+    logger.info(f"Logging to file: {log_file}")
 
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-
-    # Create root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
-    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    root_logger.addHandler(console_handler)
-
-    # File handler
-    file_handler = logging.FileHandler(log_filename)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    root_logger.addHandler(file_handler)
-
-    logger.info(f"Logging to file: {log_filename}")
-
-    # Load config to get default source_dir
-    config = load_config()
-
-    # Smoke-test the provider BEFORE the directory scan to fail fast on bad API keys
     try:
-        smoke_test_provider(config)
-    except RuntimeError as e:
-        logger.error(str(e))
-        print(f"\nError: {e}")
+        config = load_config()
+        if args.provider:
+            config = config.with_provider(args.provider)
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}. Valid providers: {', '.join(PROVIDERS)}")
         sys.exit(1)
 
     scan_path = args.path or config.source_dir
-
     if not scan_path:
-        logger.error("No path provided as argument and SOURCE_DIR is not set in .env")
-        print("\nError: No path provided. Either:")
-        print("1. Pass a path as an argument: docfiler-context /path/to/docs")
-        print("2. Set SOURCE_DIR in your .env file")
+        logger.error("No path provided. Either pass --path /path/to/docs or set SOURCE_DIR in .env")
         sys.exit(1)
-
-    # Expand user home if needed
     scan_path = Path(scan_path).expanduser()
-
-    if not scan_path.exists():
+    if not scan_path.is_dir():
         logger.error(f"Path does not exist: {scan_path}")
         sys.exit(1)
 
+    # Fail fast on bad credentials before the (potentially slow) directory scan
     try:
-        generate_context(
-            scan_path,
-            args.output,
-            max_depth=args.max_depth,
-            max_files_per_dir=args.max_files_per_dir,
-        )
+        smoke_test(create_client_from_config(config))
+    except (RuntimeError, ValueError) as e:
+        logger.error(f"Provider check failed: {e}")
+        sys.exit(1)
+
+    try:
+        generate_context(scan_path, config, args.output, args.max_depth, args.max_files_per_dir)
     except Exception as e:
         logger.error(f"Error generating context: {e}", exc_info=True)
         sys.exit(1)
