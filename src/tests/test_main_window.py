@@ -7,6 +7,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt  # noqa: E402
 from PyQt6.QtWidgets import QMessageBox  # noqa: E402
 
 from docfiler.cache_manager import CacheManager  # noqa: E402
@@ -14,7 +15,7 @@ from docfiler.gui.main_window import (  # noqa: E402
     COL_CONFIDENCE,
     COL_NEW_NAME,
     MainWindow,
-    unique_path,
+    find_conflicts,
 )
 from docfiler.models import FilingSuggestion  # noqa: E402
 
@@ -71,50 +72,65 @@ def test_move_uses_dest_base_and_skips_empty_destination(window):
     assert [p.name for p in window.files] == ["b.JPG"]
 
 
-def test_existing_target_gets_unique_name_and_bad_filename_is_refused(window):
+def _is_red(window, row: int) -> bool:
+    return window.file_list_model.item(row, COL_NEW_NAME).background().style() != Qt.BrushStyle.NoBrush
+
+
+def test_existing_target_and_bad_filename_are_refused(window):
     a, b = str(window.inbox / "a.pdf"), str(window.inbox / "b.JPG")
     window.suggestions[a] = FilingSuggestion("b.JPG", "", 0.9, "r")  # collides with b.JPG
     window.suggestions[b] = FilingSuggestion("../escape.JPG", "", 0.9, "r")
 
     window._execute(move=False)
 
-    assert (window.inbox / "b (2).JPG").read_bytes() == b"a.pdf"
+    assert (window.inbox / "a.pdf").read_bytes() == b"a.pdf"
     assert (window.inbox / "b.JPG").read_bytes() == b"b.JPG"
-    assert window.warning.called  # for the bad filename
+    assert "Rename it first" in window.warning.call_args.args[2]
 
 
-def test_move_collision_within_batch_and_with_library(window):
-    """Two files suggested to the same name both land in the destination."""
+def test_name_conflicts_are_red_and_refused_until_renamed(window):
     manuals = window.library / "Manuals"
     manuals.mkdir()
     (manuals / "Guide.pdf").write_bytes(b"older guide")
+    a, b = str(window.inbox / "a.pdf"), str(window.inbox / "b.JPG")
+    window._on_file_processed(a, FilingSuggestion("Guide.pdf", "Manuals", 0.9, "r"))  # exists in library
+    window._on_file_processed(b, FilingSuggestion("Photo.jpg", "Manuals", 0.9, "r"))
+    assert _is_red(window, 0) and not _is_red(window, 1)
+
+    window._execute(move=True)
+    assert (window.inbox / "a.pdf").exists()  # refused
+    assert (manuals / "Guide.pdf").read_bytes() == b"older guide"
+    assert (manuals / "Photo.jpg").exists()  # the other file still moved
+
+    window.file_list.setCurrentIndex(window.file_list_model.index(0, 0))
+    window._on_viewer_edited(filename="Guide v2.pdf")
+    assert not _is_red(window, 0)
+    window._execute(move=True)
+    assert (manuals / "Guide v2.pdf").read_bytes() == b"a.pdf"
+
+
+def test_same_new_name_within_batch_refuses_both(window):
     for name in ("a.pdf", "b.JPG"):
-        window.suggestions[str(window.inbox / name)] = FilingSuggestion("Guide.pdf", "Manuals", 0.9, "r")
+        window._on_file_processed(str(window.inbox / name), FilingSuggestion("Guide.pdf", "Manuals", 0.9, "r"))
+    assert _is_red(window, 0) and _is_red(window, 1)
 
     window._execute(move=True)
 
-    assert sorted(p.name for p in manuals.iterdir()) == ["Guide (2).pdf", "Guide (3).pdf", "Guide.pdf"]
-    assert window.files == [] and not window.warning.called
+    assert not (window.library / "Manuals").exists()
+    assert len(window.files) == 2
 
 
-def test_move_refuses_identical_duplicate(window):
-    (window.library / "Manuals").mkdir()
-    (window.library / "Manuals" / "Guide.pdf").write_bytes(b"a.pdf")  # same bytes as inbox/a.pdf
-    window.suggestions[str(window.inbox / "a.pdf")] = FilingSuggestion("Guide.pdf", "Manuals", 0.9, "r")
-
-    window._execute(move=True)
-
-    assert (window.inbox / "a.pdf").exists()
-    assert not (window.library / "Manuals" / "Guide (2).pdf").exists()
-    assert "identical" in window.warning.call_args.args[2]
-
-
-def test_unique_path(tmp_path):
-    target = tmp_path / "x.pdf"
-    assert unique_path(target) == target
-    target.touch()
-    (tmp_path / "x (2).pdf").touch()
-    assert unique_path(target) == tmp_path / "x (3).pdf"
+def test_find_conflicts(tmp_path):
+    (tmp_path / "taken.pdf").touch()
+    targets = {
+        str(tmp_path / "1.pdf"): tmp_path / "taken.pdf",
+        str(tmp_path / "2.pdf"): tmp_path / "dup.pdf",
+        str(tmp_path / "3.pdf"): tmp_path / "dup.pdf",
+        str(tmp_path / "4.pdf"): tmp_path / "free.pdf",
+        str(tmp_path / "taken.pdf"): tmp_path / "taken.pdf",  # unchanged name: fine
+        str(tmp_path / "5.pdf"): None,
+    }
+    assert set(find_conflicts(targets)) == {str(tmp_path / f"{n}.pdf") for n in (1, 2, 3)}
 
 
 def test_table_shows_new_name_and_confidence(window):

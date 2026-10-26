@@ -26,7 +26,7 @@ Document Filer is an AI-powered application that organizes scanned documents usi
 - **Review & Edit**: Interactive preview with the ability to manually override AI suggestions.
 - **File Management**: 
   - **Rename**: Batch rename files in their current location.
-  - **Move**: Batch file documents into their suggested folder hierarchy under `DEFAULT_DEST_BASE` or `SOURCE_DIR` (auto-creates directories, works across filesystems, never overwrites: a name collision gets a ` (2)`, ` (3)`... suffix, and a byte-identical duplicate is refused).
+  - **Move**: Batch file documents into their suggested folder hierarchy under `DEFAULT_DEST_BASE` or `SOURCE_DIR` (auto-creates directories, works across filesystems, never overwrites: a file whose new name already exists, or is shared with another file, is shown in red and refused until renamed).
 - **Result Cache**: Suggestions and manual edits are cached in `cache/` by file content hash.
 - **Context Integration**: Built-in "Generate Filing Context" button to sync AI conventions with your local directory structure.
 

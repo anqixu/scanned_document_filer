@@ -164,6 +164,11 @@ class FileViewerWidget(QWidget):
         self.confidence_label.setText("Confidence: -")
         self.reasoning_label.setText(f"Reasoning: {reason}")
 
+    def set_conflict(self, reason: str | None):
+        """Highlight the filename in red when its new name is already taken."""
+        self.filename_edit.setStyleSheet("QLineEdit { background-color: #f4b4b4; color: black; }" if reason else "")
+        self.filename_edit.setToolTip(f"Cannot move: {reason}. Rename it." if reason else "")
+
     def get_filename(self) -> str:
         return self.filename_edit.text()
 

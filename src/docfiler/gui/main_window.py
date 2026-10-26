@@ -5,12 +5,12 @@ editor on the right.
 Analysis and context generation run in background threads.
 """
 
-import filecmp
 import logging
 import os
 import shutil
 import signal
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -23,7 +23,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
     qInstallMessageHandler,
 )
-from PyQt6.QtGui import QStandardItem, QStandardItemModel
+from PyQt6.QtGui import QBrush, QColor, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -58,13 +58,26 @@ COL_FILE, COL_NEW_NAME, COL_CONFIDENCE = range(3)
 COLUMN_TITLES = ("File", "New Name", "Conf.")
 
 
-def unique_path(target: Path) -> Path:
-    """Return target, or 'stem (2).ext', 'stem (3).ext', ... if it already exists."""
-    candidate, n = target, 2
-    while candidate.exists():
-        candidate = target.with_name(f"{target.stem} ({n}){target.suffix}")
-        n += 1
-    return candidate
+CONFLICT_BACKGROUND = QBrush(QColor("#f4b4b4"))
+CONFLICT_FOREGROUND = QBrush(QColor("#000000"))
+
+
+def find_conflicts(targets: dict[str, Path | None]) -> dict[str, str]:
+    """Map source path -> reason, for sources whose target name is already taken.
+
+    A target is taken if a different file already exists there, or if several
+    sources would land on the same target.
+    """
+    counts = Counter(t for t in targets.values() if t is not None)
+    conflicts = {}
+    for key, target in targets.items():
+        if target is None or target == Path(key):
+            continue
+        if target.exists():
+            conflicts[key] = f"a file named this already exists: {target}"
+        elif counts[target] > 1:
+            conflicts[key] = f"another file has the same new name: {target}"
+    return conflicts
 
 
 def display_name(suggestion: FilingSuggestion) -> str:
@@ -156,6 +169,7 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self.suggestions: dict[str, FilingSuggestion | Exception] = {}  # str(path) -> result
         self.file_hashes: dict[str, str] = {}  # str(path) -> sha256
+        self.conflicts: dict[str, str] = {}  # str(path) -> why its new name is taken
         self.current_file_index = -1
         self.processing_thread: ProcessingThread | None = None
         self.context_thread: ContextGenerationThread | None = None
@@ -328,6 +342,7 @@ class MainWindow(QMainWindow):
                     self.suggestions[key] = cached
             self._update_item_status(key)
 
+        self._refresh_conflicts()
         logger.info(f"Found {len(self.files)} files")
         if self.files:
             row = self.current_file_index if 0 <= self.current_file_index < len(self.files) else 0
@@ -363,6 +378,34 @@ class MainWindow(QMainWindow):
             new_name.setToolTip(error)
             confidence.setText("")
 
+    def _planned_target(self, key: str, move: bool | None = None) -> Path | None:
+        """Where a file would go (move=None: move if it has a destination, else rename)."""
+        suggestion = self.suggestions.get(key)
+        if not isinstance(suggestion, FilingSuggestion):
+            return None
+        if move is None:
+            move = bool(suggestion.destination)
+        try:
+            return self._target_path(Path(key), suggestion, move)
+        except ValueError:
+            return None
+
+    def _refresh_conflicts(self):
+        """Recompute name conflicts and paint conflicting rows red."""
+        self.conflicts = find_conflicts({str(p): self._planned_target(str(p)) for p in self.files})
+        model = self.file_list_model
+        for row in range(model.rowCount()):
+            key = model.item(row, COL_FILE).data(PATH_ROLE)
+            reason = self.conflicts.get(key)
+            for col in range(model.columnCount()):
+                item = model.item(row, col)
+                item.setBackground(CONFLICT_BACKGROUND if reason else QBrush())
+                item.setForeground(CONFLICT_FOREGROUND if reason else QBrush())
+            new_name = model.item(row, COL_NEW_NAME)
+            new_name.setToolTip(f"{new_name.text()}\n\nCannot move: {reason}" if reason else new_name.text())
+        if (key := self._current_key()) is not None:
+            self.file_viewer.set_conflict(self.conflicts.get(key))
+
     def _checked_paths(self) -> list[str]:
         return [
             item.data(PATH_ROLE)
@@ -382,6 +425,7 @@ class MainWindow(QMainWindow):
         path = self.files[current.row()]
         self.file_viewer.set_file(path)
         self._show_result(str(path))
+        self.file_viewer.set_conflict(self.conflicts.get(str(path)))
 
     def _show_result(self, key: str):
         result = self.suggestions.get(key)
@@ -416,6 +460,7 @@ class MainWindow(QMainWindow):
         if destination is not None:
             suggestion.destination = destination
         self._update_item_status(key)
+        self._refresh_conflicts()
         if file_hash := self.file_hashes.get(key):
             self.cache_manager.save_gui_state(file_hash, suggestion.filename, suggestion.destination)
 
@@ -460,6 +505,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Error processing {key}: {self._error_message(result)}")
         self.suggestions[key] = result
         self._update_item_status(key)
+        self._refresh_conflicts()
         if key == self._current_key():
             self._show_result(key)
 
@@ -505,6 +551,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # Refuse every file whose new name is taken; the user must rename it first
+        conflicts = find_conflicts({k: self._planned_target(k, move) for k, _ in selected})
         done, skipped, errors = 0, 0, []
         for key, suggestion in selected:
             source = Path(key)
@@ -514,12 +562,10 @@ class MainWindow(QMainWindow):
                     logger.debug(f"Skipping {source}: nothing to {action}")
                     skipped += 1
                     continue
-                if target.exists():
-                    if target.is_file() and filecmp.cmp(source, target, shallow=False):
-                        raise FileExistsError(f"identical file already exists: {target}")
-                    unique = unique_path(target)
-                    logger.warning(f"{target} already exists; using {unique.name}")
-                    target = unique
+                if reason := conflicts.get(key):
+                    raise FileExistsError(f"{reason}. Rename it first.")
+                if target.exists():  # appeared since the check
+                    raise FileExistsError(f"a file named this already exists: {target}. Rename it first.")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(source, target)  # works across filesystems, unlike Path.rename
             except Exception as e:
@@ -539,6 +585,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, f"{action.title()} Errors", "\n".join(errors[:20]))
         if done and self.current_folder:
             self._load_folder(self.current_folder)
+        else:
+            self._refresh_conflicts()
 
     # --- context generation ---------------------------------------------------------
 
